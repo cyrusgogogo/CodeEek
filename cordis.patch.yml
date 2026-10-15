@@ -1,0 +1,4 @@
+# Adds one independent plugin; does not replace the default coding preset.
+- insert:
+    - id: code-reading
+      name: dsh-code-reading

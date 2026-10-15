@@ -1,0 +1,18 @@
+node_modules/
+.reference/
+lib/
+releases/
+.test-output/
+playwright-report/
+test-results/
+*.log
+
+# Local secrets and private keys
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx

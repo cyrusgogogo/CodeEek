@@ -1,0 +1,51 @@
+{
+  "name": "dsh-code-reading",
+  "version": "0.1.1",
+  "description": "DSH 阅读代码模式：多仓库、只读取证、交互式导师、Mermaid 与阅读档案",
+  "type": "module",
+  "license": "MIT",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./preset": "./lib/preset.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "skills", "cordis.patch.yml", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:browser": "node scripts/browser-test.mjs",
+    "pack:release": "pnpm run build && pnpm pack --pack-destination releases"
+  },
+  "dsh": {
+    "bundle": {"patch": "./cordis.patch.yml"},
+    "client": {"platform": "web", "immediately": true}
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent-preset-registry": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-connection": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-skill": "0.2.0-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-agent-preset-registry": {"optional": true},
+    "@deepseek-ai/dsh-tools": {"optional": true},
+    "@deepseek-ai/dsh-system-prompt": {"optional": true},
+    "@deepseek-ai/dsh-client-connection": {"optional": true},
+    "@deepseek-ai/dsh-skill": {"optional": true}
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-markdown": "9.1.0",
+    "remark-gfm": "4.0.1",
+    "mermaid": "11.17.2",
+    "dompurify": "3.4.17",
+    "zod": "4.6.7",
+    "playwright": "1.64.0"
+  }
+}
