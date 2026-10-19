@@ -19,5 +19,10 @@ export async function notices(metafiles) {
     }
     sections.push(`===== ${pkg.name}@${pkg.version} =====\nLicense identifier: ${typeof pkg.license === 'string' ? pkg.license : JSON.stringify(pkg.license) ?? 'Not specified in package metadata; see text below'}\n${texts.length ? texts.join('\n\n') : 'No separate license text was distributed at the package root; see upstream package and retained source notices.'}`);
   }
-  return `Third-party software bundled into dsh-code-reading\nGenerated from esbuild input metadata. React is provided externally by DSH.\n\n${sections.join('\n\n')}`;
+  for (const [name, license] of [
+    ['Material Icon Theme 5.39.0 — selected SVG assets (MIT)', 'src/client/icons/material/LICENSE'],
+    ['Lucide Static 0.468.0 — selected geometry (ISC and Feather MIT)', 'src/client/icons/lucide/LICENSE'],
+    ['shadcn/ui — adapted Select composition (MIT)', 'src/client/ui/LICENSE'],
+  ]) sections.push(`===== ${name} =====\n${await readFile(license, 'utf8')}`);
+  return `Third-party software bundled into dsh-code-reading\nGenerated from esbuild input metadata and the explicitly vendored icon subset. React is provided externally by DSH.\n\n${sections.join('\n\n')}`;
 }

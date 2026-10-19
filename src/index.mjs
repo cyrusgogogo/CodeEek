@@ -1,15 +1,16 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { homedir } from 'node:os';
 import { z } from 'zod';
+import { Config, resolveDataDirectory } from './config.mjs';
+import { PLUGIN_NAME, PLUGIN_VERSION, TARGET_DSH_VERSION, API_VERSION } from './version.mjs';
 import { ReadingStore, setRuntime, peekRuntime } from './store.mjs';
 import { PRESET, TOOL_NAMES, promptSchema, changeStageSchema, modelSchema, idSchema, requireObject, fail, effectiveModelSelection } from './contracts.mjs';
 import { checkBinding } from './filesystem.mjs';
+import { browseDirectory, viewFile, listAnnotations, createAnnotation, updateAnnotation, selectionPrompt } from './workspace.mjs';
 
 export const name = 'code-reading';
 export const inject = ['agentPresets', 'tools', 'systemPrompt', 'connection', 'sessionController', 'skills', 'agents'];
-const configSchema = z.object({ dataDir: z.string().optional() }).strict().default({});
-export const Config = configSchema;
+export { Config };
 
 export function isReadingAgent(store, presets, agent) { return !!agent && (store.sessions.has(agent.id) || (!!agent.ctx && presets.composedPreset(agent.ctx) === PRESET)); }
 export function guardReadingCall(store, presets, execution) {
@@ -17,13 +18,14 @@ export function guardReadingCall(store, presets, execution) {
 }
 
 export async function apply(ctx, rawConfig = {}) {
-  const config = configSchema.parse(rawConfig);
-  const root = config.dataDir ?? process.env.DSH_CODE_READING_HOME ?? path.join(process.env.DSH_HOME ?? path.join(homedir(), '.dsh'), 'code-reading');
+  const config = Config.parse(rawConfig);
+  const { directory: root, source: dataSource } = resolveDataDirectory(config);
   const previous = peekRuntime(ctx.root);
   if (previous && previous.store.root !== path.resolve(root)) fail('READING_ROOT_CHANGED', '改变固定产物目录需要重启 DSH，以免保留会话写入两个目录');
   const store = previous?.store ?? await new ReadingStore(root).init();
   const skill = await readFile(new URL('../skills/code-tutor/SKILL.md', import.meta.url), 'utf8');
   const runtime = previous ?? { store };
+  runtime.cancelEpochs ??= new Map();
   const activation = Symbol('code-reading activation');
   Object.assign(runtime, { skill, context: ctx, enabled: true, activation });
   runtime.isReading = agent => isReadingAgent(store, runtime.context.agentPresets, agent);
@@ -50,7 +52,7 @@ export async function apply(ctx, rawConfig = {}) {
     // Ordered, idempotent archival; snapshot recovery replays the committed DSH log after restart/failure.
     void store.archiveEvents(session.id, session.snapshotEvents()).catch(error => ctx.logger.warn(`code-reading archive failed (${session.id}): ${error.code ?? error.name}`));
   });
-  ctx.effect(() => ctx.skills.register({ name: 'code-tutor', description: '交互式代码阅读导师：业务、调用链、精读、理解验证与证据归档', source: 'bundled', content: skill }), 'code-reading: tutor skill');
+  ctx.effect(() => ctx.skills.register({ name: 'code-tutor', description: '按问题或所选代码阅读：业务、必要调用链、关键逻辑与证据归档；按需验证理解', source: 'bundled', content: skill }), 'code-reading: tutor skill');
   await ctx.effect(async () => ctx.agentPresets.register({ id: PRESET, name: '阅读代码', description: '仓库只读 · 多工作区联合阅读 · 证据与阅读产物归档；从阅读代码页面创建', order: 60, plugins: [{ name: 'dsh-code-reading/preset' }] }), 'code-reading: preset');
 
   async function ensureSession(id) {
@@ -66,21 +68,38 @@ export async function apply(ctx, rawConfig = {}) {
     return inspection;
   }
   const onlyId = params => z.object({ sessionId: idSchema }).strict().parse(params).sessionId;
-  async function dispatch(method, params, signal, admitted = false) {
+  function assertActive(signal) {
     signal?.throwIfAborted();
-    if (!admitted && ['prompt', 'stage', 'select-model'].includes(method)) {
+    if (!runtime.enabled || runtime.activation !== activation) fail('READING_UNAVAILABLE', '阅读 Host 已停用或更新。请检查插件状态，重启或刷新后再操作');
+  }
+  function assertPromptCurrent(id, epoch, signal) {
+    assertActive(signal);
+    if (epoch !== (runtime.cancelEpochs.get(id) ?? 0)) fail('PROMPT_CANCELLED', '此提问已在入队前取消，未发送给模型');
+  }
+  async function dispatch(method, params, signal, admitted = false, promptEpoch) {
+    assertActive(signal);
+    if (method === 'prompt') {
+      const id = idSchema.parse(params.sessionId);
+      promptEpoch ??= runtime.cancelEpochs.get(id) ?? 0;
+      if (promptEpoch !== (runtime.cancelEpochs.get(id) ?? 0)) fail('PROMPT_CANCELLED', '此提问已在入队前取消，未发送给模型');
+    }
+    if (!admitted && ['prompt', 'stage', 'select-model', 'annotation-create', 'annotation-update', 'reader-state'].includes(method)) {
       const id = idSchema.parse(params.sessionId);
       await ensureSession(id);
-      return store.lock(`admission:${id}`, () => dispatch(method, params, signal, true));
+      return store.lock(`admission:${id}`, () => dispatch(method, params, signal, true, promptEpoch));
     }
     switch (method) {
+      case 'status': {
+        requireObject(params, []);
+        return { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: store.root, dataSource, tools: [...TOOL_NAMES] };
+      }
       case 'list': requireObject(params, []); return store.list();
       case 'create-project': return store.createProject(params);
       case 'create-session': {
         const { projectId } = z.object({ projectId: idSchema }).strict().parse(params);
         const state = await store.createSession(projectId);
         await ctx.sessionController.create({ sessionId: state.id, cwd: store.sessionDir(state.id), agentPreset: PRESET });
-        await ctx.sessionController.rename({ sessionId: state.id, title: `阅读 · ${store.project(projectId).title}` });
+        await ctx.sessionController.rename({ sessionId: state.id, title: '未命名阅读主题' });
         return { sessionId: state.id };
       }
       case 'snapshot': {
@@ -95,20 +114,62 @@ export async function apply(ctx, rawConfig = {}) {
       case 'prompt': {
         const args = promptSchema.parse(params); const agent = await ensureSession(args.sessionId);
         const inspection = await ctx.sessionController.inspect(args.sessionId);
+        assertPromptCurrent(args.sessionId, promptEpoch, signal);
         const alreadyAccepted = inspection.events.some(event => event.type === 'user/message' && event.data.source?.kind === 'user' && event.data.source.rpcId === args.requestId) || [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])].some(message => message.source?.kind === 'user' && message.source.rpcId === args.requestId);
         if (alreadyAccepted) return { accepted: true, replayed: true, running: runtime.busy(args.sessionId) };
         if (store.session(args.sessionId).revision !== args.expectedRevision) fail('STALE_REVISION', '阅读阶段已变化，请刷新后重新发送');
         if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '本轮阅读还在进行，请等待或停止后再发送');
-        const selected = effectiveModelSelection(inspection.events, ctx.get('agentDefaultModel')?.currentSelection() ?? null);
+        const admittedModel = effectiveModelSelection(inspection.events, ctx.get('agentDefaultModel')?.currentSelection() ?? null);
+        if (!admittedModel || admittedModel.provider !== args.expectedModel.provider || admittedModel.model !== args.expectedModel.model) fail('MODEL_CHANGED', '本会话实际模型已变化，请刷新确认提供方后重发');
+        const text = args.text + (args.selection ? await selectionPrompt(store, args.sessionId, args.selection, signal, args.intent) : '');
+        // selectionPrompt has verified these coordinates against the actual file; never persist its quote here.
+        const focus = args.selection ? { repoId: args.selection.repoId, path: args.selection.path, fileHash: args.selection.fileHash, start: { ...args.selection.start }, end: { ...args.selection.end } } : null;
+        // Catalog/system-prompt assembly can begin synchronously in native prompt().
+        // Commit metadata first; it must never consume the compatibility stage revision.
+        await store.updateReadingMode(args.sessionId, args.selection ? 'code' : args.readingMode, () => {
+          assertPromptCurrent(args.sessionId, promptEpoch, signal);
+          if (store.session(args.sessionId).revision !== args.expectedRevision) fail('STALE_REVISION', '阅读阶段已变化，请刷新后重新发送');
+          if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '本轮阅读还在进行，请等待或停止后再发送');
+        }, args.intent, focus);
+        const currentInspection = await ctx.sessionController.inspect(args.sessionId);
+        // Keep all final checks and enqueue in one synchronous segment after the last await.
+        assertPromptCurrent(args.sessionId, promptEpoch, signal);
+        if (store.session(args.sessionId).revision !== args.expectedRevision) fail('STALE_REVISION', '阅读阶段已变化，请刷新后重新发送');
+        if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '本轮阅读还在进行，请等待或停止后再发送');
+        const selected = effectiveModelSelection(currentInspection.events, ctx.get('agentDefaultModel')?.currentSelection() ?? null);
         if (!selected || selected.provider !== args.expectedModel.provider || selected.model !== args.expectedModel.model) fail('MODEL_CHANGED', '本会话实际模型已变化，请刷新确认提供方后重发');
-        return ctx.sessionController.prompt({ sessionId: agent.id, requestId: args.requestId, mode: 'queue', content: [{ type: 'text', text: args.text }] }, signal);
+        return ctx.sessionController.prompt({ sessionId: agent.id, requestId: args.requestId, mode: 'queue', content: [{ type: 'text', text }] }, signal);
       }
       case 'stage': {
         const args = changeStageSchema.parse(params);
-        await ensureSession(args.sessionId);
+        await ensureSession(args.sessionId); assertActive(signal);
         if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能改变阶段或主题；请先停止');
-        return store.changeStage(args);
+        const state = store.session(args.sessionId);
+        const firstTopic = !!args.topic.trim() && !state.stageHistory.some(item => item.topic?.trim());
+        const defaults = new Set(['未命名阅读主题', `阅读 · ${store.project(state.projectId).title}`]);
+        let previousTitle;
+        if (firstTopic) {
+          try { previousTitle = (await ctx.sessionController.inspect(args.sessionId)).meta?.title; }
+          catch { /* Unknown title: keep the native session name rather than overwrite user history. */ }
+        }
+        assertActive(signal);
+        if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能改变阶段或主题；请先停止');
+        const result = await store.changeStage(args);
+        if (firstTopic && defaults.has(previousTitle)) {
+          try {
+            const currentTitle = (await ctx.sessionController.inspect(args.sessionId)).meta?.title;
+            assertActive(signal);
+            if (currentTitle === previousTitle) await ctx.sessionController.rename({ sessionId: args.sessionId, title: args.topic.trim().slice(0, 120) });
+          } catch (error) { ctx.logger.warn(`code-reading theme title unchanged (${args.sessionId}): ${error.code ?? error.name}`); }
+        }
+        return result;
       }
+      case 'reader-state': return store.updateReaderState(params, () => assertActive(signal));
+      case 'tree': return browseDirectory(store, params, signal);
+      case 'view-file': return viewFile(store, params, signal, () => assertActive(signal));
+      case 'annotations': return listAnnotations(store, params);
+      case 'annotation-create': return createAnnotation(store, params, signal, () => assertActive(signal));
+      case 'annotation-update': return updateAnnotation(store, params, signal, () => assertActive(signal));
       case 'read': {
         const { sessionId, ...args } = requireObject(params, ['sessionId', 'repoId', 'path', 'offset', 'limit', 'symbol']); store.session(sessionId); return store.read(sessionId, args, signal);
       }
@@ -124,21 +185,25 @@ export async function apply(ctx, rawConfig = {}) {
       case 'export': { const id = onlyId(params); await archive(id); return store.exportSession(id); }
       case 'models': requireObject(params, []); return ctx.sessionController.modelCatalog();
       case 'select-model': {
-        const args = modelSchema.parse(params); await ensureSession(args.sessionId);
+        const args = modelSchema.parse(params); await ensureSession(args.sessionId); assertActive(signal);
         if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能切换模型');
         return ctx.sessionController.selectModel(args);
       }
-      case 'cancel': { const id = onlyId(params); return ctx.sessionController.cancel({ sessionId: id }); }
+      case 'cancel': {
+        const id = onlyId(params); store.session(id);
+        runtime.cancelEpochs.set(id, (runtime.cancelEpochs.get(id) ?? 0) + 1);
+        return ctx.sessionController.cancel({ sessionId: id });
+      }
       default: fail('UNKNOWN_METHOD', '不支持此阅读页面操作');
     }
   }
   runtime.dispatch = dispatch;
   await ctx.effect(() => ctx.connection.fetch.register({ path: '/api/code-reading', methods: ['POST'], requestBody: 'buffered', fetch: async request => {
     try {
-      if (!request.headers.get('content-type')?.startsWith('application/json')) return Response.json({ error: '需要 JSON 请求' }, { status: 415 });
-      const text = await request.text(); if (text.length > 131072) fail('REQUEST_LIMIT', '请求超过 128 KiB');
+      if (request.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'application/json') return Response.json({ ok: false, error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: '需要 application/json 请求' } }, { status: 415 });
+      const text = await request.text(); if (Buffer.byteLength(text, 'utf8') > 131072) fail('REQUEST_LIMIT', '请求超过 128 KiB');
       const body = z.object({ method: z.string().max(40), params: z.record(z.string(), z.unknown()).default({}) }).strict().parse(JSON.parse(text));
       const value = await dispatch(body.method, body.params, request.signal); return Response.json({ ok: true, value });
-    } catch (error) { return Response.json({ ok: false, error: { code: error.code ?? 'INVALID_REQUEST', message: error.message } }, { status: 400 }); }
+    } catch (error) { const status = error.code === 'READING_UNAVAILABLE' ? 503 : error.code === 'REQUEST_LIMIT' ? 413 : 400; return Response.json({ ok: false, error: { code: error.code ?? 'INVALID_REQUEST', message: error.message } }, { status }); }
   } }), 'code-reading: authenticated Connection route');
 }

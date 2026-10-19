@@ -1,9 +1,14 @@
 {
   "name": "dsh-code-reading",
-  "version": "0.1.1",
+  "version": "0.1.7",
   "description": "DSH 阅读代码模式：多仓库、只读取证、交互式导师、Mermaid 与阅读档案",
   "type": "module",
   "license": "MIT",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=22.18.0",
+    "dsh": "0.2.1-rc.2"
+  },
   "main": "./lib/index.js",
   "exports": {
     ".": "./lib/index.js",
@@ -12,40 +17,78 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
-  "files": ["lib", "skills", "cordis.patch.yml", "README.md", "LICENSE"],
+  "files": [
+    "lib",
+    "skills",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "docs/INSTALL.md",
+    "docs/USAGE.md"
+  ],
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepack": "node scripts/doctor.mjs --package-only",
     "test": "node --test test/*.test.mjs",
     "test:browser": "node scripts/browser-test.mjs",
-    "pack:release": "pnpm run build && pnpm pack --pack-destination releases"
+    "test:package": "node scripts/smoke-package.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "verify:package": "node scripts/verify-package.mjs",
+    "check": "node scripts/build.mjs && node --test test/*.test.mjs && node scripts/browser-test.mjs && node scripts/doctor.mjs",
+    "pack:release": "node scripts/release.mjs"
   },
   "dsh": {
-    "bundle": {"patch": "./cordis.patch.yml"},
-    "client": {"platform": "web", "immediately": true}
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-agent-preset-registry": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-connection": "0.2.0-rc.2",
-    "@deepseek-ai/dsh-skill": "0.2.0-rc.2"
+    "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-connection": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-skill": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-agent-preset-registry": {"optional": true},
-    "@deepseek-ai/dsh-tools": {"optional": true},
-    "@deepseek-ai/dsh-system-prompt": {"optional": true},
-    "@deepseek-ai/dsh-client-connection": {"optional": true},
-    "@deepseek-ai/dsh-skill": {"optional": true}
+    "@deepseek-ai/dsh-agent-preset-registry": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-system-prompt": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-connection": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-skill": {
+      "optional": true
+    }
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/cordis-plugin-group": "1.0.5",
+    "@deepseek-ai/cordis-plugin-include": "1.0.10",
+    "@deepseek-ai/cordis-plugin-loader": "1.0.6",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2",
+    "@radix-ui/react-select": "2.4.1",
+    "dompurify": "3.4.17",
     "esbuild": "0.25.12",
+    "highlight.js": "11.11.2",
+    "lowlight": "3.3.0",
+    "mermaid": "11.17.2",
+    "playwright": "1.64.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-markdown": "9.1.0",
     "remark-gfm": "4.0.1",
-    "mermaid": "11.17.2",
-    "dompurify": "3.4.17",
-    "zod": "4.6.7",
-    "playwright": "1.64.0"
+    "zod": "4.6.7"
   }
 }

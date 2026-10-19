@@ -1,112 +1,424 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { STAGES, STAGE_LABELS } from '../contracts.mjs';
 import { MermaidDiagram, renderDiagramDocument } from './mermaid.jsx';
-import css from './style.css';
+import { api, validateHostStatus, ReadingApiError } from './api.mjs';
+import { InstallationHelp } from './setup.jsx';
+import { CodeFence } from './code.jsx';
+import { FileWorkspace, FileRail, FileViewer, DocumentTabs } from './reader.jsx';
+import { topicTitle, ReadingRoute, LessonArticle, ReadingDialog, Transcript } from './workbench.jsx';
+import { UiIcon } from './icons/ui-icons.jsx';
+import { ModelSelect } from './model-select.jsx';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select.jsx';
+import baseCss from './style.css';
+import workbenchCss from './workbench.css';
+import selectCss from './ui/select.css';
+import ideCss from './ide.css';
+import codeReadingsCss from './code-readings.css';
+const css = baseCss + '\n' + workbenchCss + '\n' + selectCss + '\n' + ideCss + '\n' + codeReadingsCss;
 
-export { renderDiagramDocument };
+export { renderDiagramDocument, api };
 export const inject = ['slots', 'uiWorkspace'];
-export async function api(method, params = {}, signal) {
-  const fetcher = globalThis.__DSH_TRANSPORT__?.fetch ?? globalThis.fetch.bind(globalThis);
-  const response = await fetcher('api/code-reading', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ method, params }), ...(signal ? { signal } : {}) });
-  const result = await response.json();
-  if (!result.ok) throw new Error(`${result.error?.message ?? '阅读模式请求失败'}${result.error?.code ? ` (${result.error.code})` : ''}`);
-  return result.value;
-}
 const uuid = () => crypto.randomUUID();
 function BookIcon({ size = 18 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5c-3-2-7-2-10-1v15c3-1 7-1 10 1m0-15c3-2 7-2 10-1v15c-3-1-7-1-10 1V5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" /></svg>; }
+function MarkdownPre({ children }) {
+  const element = React.Children.toArray(children).find(React.isValidElement);
+  const language = /(?:^|\s)language-([^\s]+)/i.exec(element?.props.className ?? '')?.[1]?.toLowerCase();
+  if (language === 'mermaid') return <MermaidDiagram source={String(element.props.children).trim()} />;
+  return <CodeFence>{children}</CodeFence>;
+}
 export function Markdown({ text, openEvidence }) {
   return <div className="cr-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={url => url.startsWith('evidence://') || /^https?:\/\//.test(url) ? url : ''} components={{
     img: ({ alt }) => <span className="cr-muted">[图片未自动加载：{alt || '外部媒体'}]</span>,
     a: ({ href, children }) => href?.startsWith('evidence://') ? <button className="cr-link" type="button" onClick={() => openEvidence(href.slice(11))}>{children}</button> : href ? <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> : <span>{children}</span>,
-    code: ({ className, children }) => className === 'language-mermaid' ? <MermaidDiagram source={String(children).trim()} /> : <code className={className}>{children}</code>
+    pre: MarkdownPre
   }}>{text}</ReactMarkdown></div>;
 }
-function Source({ source, close, repositories }) {
-  if (!source) return null;
-  const evidence = source.evidence; const repo = repositories.find(r => r.id === evidence.repoId);
-  return <section className="cr-card cr-source" aria-label="代码证据"><div className="cr-row"><strong>{repo?.name} · {evidence.path}:{evidence.startLine}–{evidence.endLine}</strong><button type="button" onClick={close}>关闭证据</button></div>
-    <p className="cr-path">{evidence.repoId} · {evidence.symbol || '未指定符号线索'}<br />读取版本 SHA256：{evidence.hash}</p>
-    {source.stale && <div className="cr-banner" role="alert">旧证据已失效或不可读取。以下是当前源码（如可读），不是旧版本的承诺；需要重新取证。{source.reason && ` 原因：${source.reason}`}</div>}
-    <pre>{source.lines?.map(line => <div className="cr-source-line" key={line.number}><span>{line.number}</span><code>{line.text}</code></div>)}</pre>
-  </section>;
-}
 function ProjectForm({ workspaces, pickDirectory, onCreate, busy, cancel }) {
-  const [title, setTitle] = useState(''); const [repos, setRepos] = useState([{ name: '', path: '' }]);
-  const update = (index, field, value) => setRepos(rows => rows.map((r, i) => i === index ? { ...r, [field]: value } : r));
-  return <section className="cr-empty cr-card"><h2>新建阅读项目</h2><p className="cr-muted">选择需要联合理解的仓库。绑定后不可随工作区切换而改变；需要新增仓库时新建阅读项目，保留原项目的证据与历史。</p>
-    <form className="cr-form" onSubmit={event => { event.preventDefault(); onCreate({ title, repositories: repos }); }}>
-      <label>项目名称<input required maxLength={120} value={title} onChange={e => setTitle(e.target.value)} placeholder="例如：订单与支付调用链" /></label>
-      {workspaces.length > 0 && <label>从 DSH 工作区添加<select value="" onChange={e => { const ws = workspaces.find(w => w.workspaceId === e.target.value); if (ws) setRepos(rows => [...rows.filter(r => r.path.trim()), { name: ws.title, path: ws.path, workspaceId: ws.workspaceId }]); }}><option value="">选择工作区…</option>{workspaces.map(w => <option key={w.workspaceId} value={w.workspaceId}>{w.title} — {w.path}</option>)}</select></label>}
-      {repos.map((repo, index) => <div className="cr-repo" key={index}><input aria-label={`仓库 ${index + 1} 名称`} required maxLength={60} value={repo.name} onChange={e => update(index, 'name', e.target.value)} placeholder="仓库名称" /><input aria-label={`仓库 ${index + 1} 目录`} required value={repo.path} onChange={e => update(index, 'path', e.target.value)} placeholder="本地仓库绝对路径" /><div className="cr-row"><button type="button" onClick={async () => { const p = await pickDirectory(); if (p) { update(index, 'path', p); if (!repo.name) update(index, 'name', p.split(/[\\/]/).filter(Boolean).pop()); } }}>选择目录</button>{repos.length > 1 && <button type="button" onClick={() => setRepos(rows => rows.filter((_, i) => i !== index))}>移除</button>}</div></div>)}
-      <div className="cr-row"><button type="button" disabled={repos.length >= 12} onClick={() => setRepos(rows => [...rows, { name: '', path: '' }])}>添加仓库</button><button className="cr-primary" disabled={busy} type="submit">创建并开始阅读</button><button type="button" disabled={busy} onClick={cancel}>取消</button></div>
+  const [repos, setRepos] = useState([{ path: '' }]);
+  const update = (index, value) => setRepos(rows => rows.map((repo, i) => i === index ? { ...repo, path: value } : repo));
+  return <section className="cr-empty cr-card cr-open-repository">
+    <span className="cr-start-symbol"><UiIcon name="folder-tree" size={24} /></span>
+    <h2>打开本地仓库</h2><p className="cr-muted">选择目录就可以开始，自动使用仓库名称。源码始终只读。</p>
+    <form className="cr-form" onSubmit={event => { event.preventDefault(); onCreate({ repositories: repos }); }}>
+      {workspaces.length > 0 && <label>从 DSH 工作区添加<select value="" onChange={event => { const ws = workspaces.find(item => item.workspaceId === event.target.value); if (ws) setRepos(rows => [...rows.filter(repo => repo.path.trim()), { path: ws.path, workspaceId: ws.workspaceId }]); }}><option value="">选择工作区…</option>{workspaces.map(ws => <option key={ws.workspaceId} value={ws.workspaceId}>{ws.title} — {ws.path}</option>)}</select></label>}
+      {repos.map((repo, index) => <div className="cr-repo" key={index}><input aria-label={`仓库 ${index + 1} 目录`} required value={repo.path} onChange={event => update(index, event.target.value)} placeholder="本地仓库绝对路径" /><div className="cr-row"><button type="button" onClick={async () => { const path = await pickDirectory(); if (path) update(index, path); }}>选择目录</button>{repos.length > 1 && <button type="button" aria-label={`移除仓库 ${index + 1}`} onClick={() => setRepos(rows => rows.filter((_, i) => i !== index))}>移除</button>}</div></div>)}
+      <div className="cr-row"><button type="button" disabled={repos.length >= 12} onClick={() => setRepos(rows => [...rows, { path: '' }])}>添加仓库</button><button className="cr-primary" disabled={busy} type="submit">打开仓库</button><button type="button" disabled={busy} onClick={cancel}>取消</button></div>
+      <p className="cr-form-note">打开仓库不会调用模型；发送阅读问题前会请你确认源码范围。</p>
     </form>
   </section>;
+}
+function savedSession() { try { return localStorage.getItem('dsh-code-reading:active') ?? ''; } catch { return ''; } }
+function checkedModels(value) {
+  if (!value || !Array.isArray(value.groups) || value.groups.some(group => typeof group.id !== 'string' || !Array.isArray(group.models) || group.models.some(model => typeof model.id !== 'string'))) throw new ReadingApiError('PROTOCOL_ERROR', '模型目录格式不正确，请在 DSH 设置中检查模型配置后重试');
+  return value;
+}
+const emptyReaderState = () => ({ version: 1, revision: 0, activeDocument: null, selectedLessonId: null, viewedLessonIds: [], understoodLessonIds: [], readerPosition: null, lessonScrollTop: 0 });
+function positionMetadata(position) {
+  if (!position?.repoId || !position?.path) return null;
+  return { repoId: position.repoId, path: position.path, hash: position.hash ?? null, offset: position.offset ?? 1, scrollTop: position.scrollTop ?? 0, scrollLeft: position.scrollLeft ?? 0 };
 }
 export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   const workspaces = useWorkspaces ? useWorkspaces(state => state.items) : [];
   const [listing, setListing] = useState({ projects: [], root: '', diagnostics: [] });
-  const [activeId, setActiveId] = useState(() => localStorage.getItem('dsh-code-reading:active') ?? '');
-  const [snapshot, setSnapshot] = useState(null); const [creating, setCreating] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
-  const [tab, setTab] = useState('lessons'); const [draft, setDraft] = useState(''); const [topic, setTopic] = useState(''); const [source, setSource] = useState(null); const [models, setModels] = useState(null); const [model, setModel] = useState('');
-  const [repoId, setRepoId] = useState(''); const [query, setQuery] = useState(''); const [results, setResults] = useState(null); const [waiting, setWaiting] = useState(false); const [olderMessages, setOlderMessages] = useState([]);
-  const activeRef = useRef(activeId); activeRef.current = activeId; const snapshotAbort = useRef(null); const waitingBaseline = useRef(-1); const pendingPrompt = useRef(null);
-  async function refreshList() { const result = await api('list'); setListing(result); return result; }
+  const [activeId, setActiveId] = useState(savedSession);
+  const [loadedSnapshot, setSnapshot] = useState(null); const snapshot = loadedSnapshot?.sessionId === activeId ? loadedSnapshot : null;
+  const [creating, setCreating] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
+  const [draft, setDraft] = useState(''); const [entryMode, setEntryMode] = useState('question'); const [activeDocument, setActiveDocument] = useState('empty'); const [readingDocuments, setReadingDocuments] = useState([]); const [composerOpen, setComposerOpen] = useState(false); const [models, setModels] = useState(null); const [model, setModel] = useState('');
+  const [repoId, setRepoId] = useState(''); const [waiting, setWaiting] = useState(false); const [accepting, setAccepting] = useState(false); const [cancelPending, setCancelPending] = useState(false); const [history, setHistory] = useState({ sessionId: '', epoch: -1, rows: [] });
+  const [connection, setConnection] = useState({ state: 'loading', status: null, error: null }); const [listState, setListState] = useState('loading'); const [snapshotState, setSnapshotState] = useState('idle'); const [modelsState, setModelsState] = useState('loading');
+  const [projectOpen, setProjectOpen] = useState(false); const pendingProjectDialog = useRef(false);
+  const [dialog, setDialog] = useState(''); const [menuOpen, setMenuOpen] = useState(false); const [routeOpen, setRouteOpen] = useState(true); const [viewStage, setViewStage] = useState('discover'); const [selectedId, setSelectedId] = useState(null);
+  const [viewed, setViewed] = useState([]); const [understood, setUnderstood] = useState([]); const [questionSelection, setQuestionSelection] = useState(null); const [returnPoint, setReturnPoint] = useState(null); const [confirmation, setConfirmation] = useState(null); const [lastFailed, setLastFailed] = useState(null);
+  const activeRef = useRef(activeId); activeRef.current = activeId; const viewEpoch = useRef(0); const initializedView = useRef(null); const pendingOperations = useRef(0); const snapshotAbort = useRef(null); const setupAbort = useRef(null); const mounted = useRef(true); const waitingBaseline = useRef(-1); const pendingPrompt = useRef(null);
+  const reader = useRef(null); const restorePending = useRef(null); const content = useRef(null); const readerStates = useRef(new Map()); const saveChains = useRef(new Map()); const consent = useRef(null); const navigation = useRef(0); const followResult = useRef(null); const lastAttempt = useRef(null); const submitting = useRef(null); const evidenceSequence = useRef(0); const listSequence = useRef(0); const cancelAcknowledged = useRef(false);
+  const selectedLesson = snapshot?.state.lessons.find(lesson => lesson.id === selectedId) ?? null;
+  const olderMessages = history.sessionId === activeId && history.epoch === viewEpoch.current ? history.rows : [];
+  const ready = connection.state === 'ready' && listState === 'ready'; const running = !!snapshot?.running || waiting;
+  const hasStarted = !!snapshot && (snapshot.state.lessons.length > 0 || snapshot.messages.length > 0 || !!snapshot.turnEnd || running);
+  const currentProject = snapshot?.project ?? listing.projects.find(project => project.sessions.some(session => session.id === activeId));
+  const scope = snapshot ? JSON.stringify({ sessionId: activeId, model, bindingRevision: snapshot.project.bindingRevision, repos: snapshot.project.repositories.map(repo => [repo.id, repo.root]) }) : '';
+  const requestedDocument = useRef(null);
+  const handleController = useCallback(controller => { reader.current = controller; if (controller && restorePending.current) { controller.restorePosition(restorePending.current, { activate: false }); restorePending.current = null; } }, []);
+  function rememberReadingDocument(id, title, projectId = currentProject?.id) { if (!id || !projectId) return; const document = { sessionId: id, title: topicTitle(title), projectId }; setReadingDocuments(rows => (rows.some(row => row.sessionId === id) ? rows.map(row => row.sessionId === id ? document : row) : [...rows, document]).slice(-20)); }
+  function openReading(id = activeId, lessonId = null) {
+    const knownProject = listing.projects.find(item => item.sessions.some(session => session.id === id));
+    const project = knownProject ?? (lessonId ? currentProject : null);
+    const lesson = lessonId && id === activeId ? snapshot?.state.lessons.find(item => item.id === lessonId) : null;
+    if (lessonId && ((!project || project.id !== currentProject?.id) || (id === activeId && !lesson))) { setNotice('该方法关联的阅读记录不可用，请刷新文件后重试。'); return; }
+    const session = project?.sessions?.find(item => item.id === id);
+    rememberReadingDocument(id, id === snapshot?.sessionId ? snapshot.topic : session?.topic, project?.id);
+    navigation.current++; setComposerOpen(false);
+    if (id === activeId) {
+      requestedDocument.current = null; setCreating(false);
+      if (lesson) { void savePosition(); selectLesson(lesson); }
+      else { setActiveDocument('reading'); void persistReading({ activeDocument: 'reading' }); }
+    } else { requestedDocument.current = { id, kind: 'reading', ...(lessonId ? { lessonId, projectId: project.id } : {}) }; switchSession(id); }
+    if (window.matchMedia('(max-width:1100px)').matches) setRouteOpen(false);
+    if (window.matchMedia('(max-width:900px)').matches) reader.current?.close();
+  }
+  function closeReadingDocument(document) {
+    setReadingDocuments(rows => rows.filter(row => row.sessionId !== document.sessionId));
+    if (document.sessionId !== activeId || activeDocument !== 'reading') return;
+    const other = readingDocuments.filter(row => row.projectId === currentProject?.id && row.sessionId !== document.sessionId).at(-1);
+    if (reader.current?.capturePosition()) reader.current.showSource(); else if (other) openReading(other.sessionId); else setActiveDocument('empty');
+  }
+  const visibleReadingDocuments = readingDocuments.filter(document => document.projectId === currentProject?.id).map(document => ({ ...document, title: topicTitle(document.sessionId === snapshot?.sessionId ? snapshot.topic : currentProject?.sessions?.find(session => session.id === document.sessionId)?.topic, document.title) }));
+
+  async function refreshList(signal) { const sequence = ++listSequence.current; const startedId = activeRef.current; const result = await api('list', {}, signal); if (mounted.current && !signal?.aborted && sequence === listSequence.current) { if (activeRef.current && activeRef.current === startedId && !result.projects.some(p => p.sessions.some(s => s.id === activeRef.current))) setActiveId(''); setListing(result); setListState('ready'); } return result; }
+  async function refreshModels(signal) {
+    setModelsState('loading');
+    try { const value = checkedModels(await api('models', {}, signal)); if (mounted.current && !signal?.aborted) { setModels(value); setModelsState('ready'); setNotice(previous => previous.startsWith('模型目录暂不可用：') ? '' : previous); } return value; }
+    catch (e) { if (e.name !== 'AbortError' && !signal?.aborted && mounted.current) { setModelsState('error'); setNotice(`模型目录暂不可用：${e.message}`); } throw e; }
+  }
+  async function loadSetup() {
+    setupAbort.current?.abort(); const controller = new AbortController(); setupAbort.current = controller;
+    setConnection({ state: 'loading', status: null, error: null }); setListState('loading'); setModelsState('loading');
+    try {
+      const status = validateHostStatus(await api('status', {}, controller.signal));
+      if (!mounted.current || controller.signal.aborted) return;
+      setConnection({ state: 'ready', status, error: null });
+      const [listResult] = await Promise.allSettled([refreshList(controller.signal), refreshModels(controller.signal)]);
+      if (!mounted.current || controller.signal.aborted) return;
+      if (listResult.status === 'rejected') { setListState('error'); setError(listResult.reason.message); }
+    } catch (e) {
+      if (e.name === 'AbortError' || controller.signal.aborted || !mounted.current) return;
+      setConnection({ state: 'error', status: null, error: e }); setListState('error'); setModelsState('error');
+    }
+  }
   async function refresh(id = activeRef.current) {
     if (!id) return null;
-    snapshotAbort.current?.abort(); const controller = new AbortController(); snapshotAbort.current = controller;
-    try { const value = await api('snapshot', { sessionId: id }, controller.signal); if (activeRef.current === id) { setSnapshot(value); setModel(value.modelSelection ? `${value.modelSelection.provider}\u0000${value.modelSelection.model}` : ''); if (!value.running && (value.turnEnd?.seq ?? -1) > waitingBaseline.current) { setWaiting(false); if (value.turnEnd?.reason.kind !== 'completed') setNotice(`本轮已结束：${value.turnEnd.reason.kind}。可检查对话留痕后重试。`); } } return value; } catch (e) { if (e.name !== 'AbortError') throw e; return null; }
+    const epoch = viewEpoch.current; snapshotAbort.current?.abort(); const controller = new AbortController(); snapshotAbort.current = controller; setSnapshotState('loading');
+    try {
+      const value = await api('snapshot', { sessionId: id }, controller.signal);
+      if (!mounted.current || controller.signal.aborted || activeRef.current !== id || viewEpoch.current !== epoch) return null;
+      const state = value.state.readerState ?? emptyReaderState(); const known = readerStates.current.get(id);
+      if (!known || state.revision >= known.revision) readerStates.current.set(id, state);
+      if (initializedView.current?.id !== id || initializedView.current.epoch !== epoch) {
+        const requested = requestedDocument.current?.id === id ? requestedDocument.current : null;
+        const linkedLesson = requested?.lessonId ? value.state.lessons.find(item => item.id === requested.lessonId) : null;
+        if (requested?.lessonId && (requested.projectId !== value.project.id || !linkedLesson)) throw new Error('该方法关联的阅读记录已不可用，请刷新文件后重试；不会自动改开其他知识点。');
+        initializedView.current = { id, epoch }; setEntryMode(value.readingMode ?? 'question'); setRepoId(value.project.repositories[0]?.id ?? '');
+        const storedLesson = value.state.lessons.find(item => item.id === state.selectedLessonId);
+        const lesson = linkedLesson ?? storedLesson ?? value.state.lessons.at(-1) ?? null;
+        const viewedIds = [...new Set([...state.viewedLessonIds, ...(lesson ? [lesson.id] : [])])];
+        setSelectedId(lesson?.id ?? null); setViewStage(lesson?.stage ?? value.stage); setViewed(viewedIds); setUnderstood(state.understoodLessonIds);
+        restorePending.current = state.readerPosition;
+        const requestedKind = requested?.kind ?? null;
+        const kind = requestedKind ?? state.activeDocument ?? (state.readerPosition ? 'source' : lesson ? 'reading' : 'empty');
+        requestedDocument.current = null; setActiveDocument(kind); if (kind === 'reading') rememberReadingDocument(id, value.topic, value.project.id);
+        if (requestedKind) void persistReading({ activeDocument: requestedKind, ...(linkedLesson ? { viewStage: linkedLesson.stage, selectedLessonId: linkedLesson.id, viewedLessonIds: viewedIds, lessonScrollTop: 0 } : {}) }, id);
+        if (!value.state.lessons.length && !value.messages.length) setDraft(value.topic || '');
+        requestAnimationFrame(() => { if (content.current && activeRef.current === id && viewEpoch.current === epoch) content.current.scrollTop = linkedLesson ? 0 : state.lessonScrollTop ?? 0; });
+      } else if (followResult.current?.id === id && followResult.current.navigation === navigation.current) {
+        const newest = value.state.lessons.at(-1);
+        if (newest && newest.id !== followResult.current.lastLessonId) { setSelectedId(newest.id); setViewStage(newest.stage); setViewed(previous => [...new Set([...previous, newest.id])]); setActiveDocument('reading'); rememberReadingDocument(id, value.topic, value.project.id); void persistReading({ activeDocument: 'reading', selectedLessonId: newest.id, viewedLessonIds: [...new Set([...viewed, newest.id])] }, id); setComposerOpen(false); followResult.current = null; }
+      }
+      setSnapshot(value); setSnapshotState('ready'); setModel(value.modelSelection ? `${value.modelSelection.provider}\u0000${value.modelSelection.model}` : '');
+      if (!value.running && cancelAcknowledged.current && (!submitting.current || submitting.current.settled)) {
+        setWaiting(false); setAccepting(false); setCancelPending(false); cancelAcknowledged.current = false;
+        setNotice(value.turnEnd?.reason.kind === 'cancelled' ? '本轮已取消，已完成内容保留。' : '停止请求已确认，后端当前空闲。未提供新的结束原因；已完成内容保留。');
+      }
+      if (!value.running && (value.turnEnd?.seq ?? -1) > waitingBaseline.current) {
+        setWaiting(false); setAccepting(false); setCancelPending(false);
+        if (value.turnEnd?.reason.kind !== 'completed') { setNotice(`本轮已结束：${value.turnEnd.reason.kind}。已完成知识点和位置保留。`); if (lastAttempt.current?.sessionId === id) setLastFailed(lastAttempt.current); }
+      }
+      return value;
+    } catch (e) {
+      if (e.name === 'AbortError' || controller.signal.aborted || activeRef.current !== id || viewEpoch.current !== epoch || !mounted.current) return null;
+      setSnapshotState('error'); throw e;
+    }
   }
-  async function perform(operation) { setBusy(true); setError(''); try { await operation(); } catch (e) { setError(e.message); } finally { setBusy(false); } }
+  async function loadOlderMessages() {
+    const id = activeRef.current; const epoch = viewEpoch.current; const beforeSeq = (olderMessages.length ? olderMessages : snapshot.messages)[0]?.seq;
+    const value = await api('snapshot', { sessionId: id, beforeSeq });
+    if (!mounted.current || activeRef.current !== id || viewEpoch.current !== epoch) return;
+    setHistory(previous => {
+      if (!mounted.current || activeRef.current !== id || viewEpoch.current !== epoch) return previous;
+      const existing = previous.sessionId === id && previous.epoch === epoch ? previous.rows : [];
+      return { sessionId: id, epoch, rows: [...new Map([...value.messages, ...existing].map(message => [message.seq, message])).values()].sort((a, b) => a.seq - b.seq) };
+    });
+  }
+  async function perform(operation) { const id = activeRef.current; const epoch = viewEpoch.current; pendingOperations.current++; setBusy(true); setError(''); try { await operation(); } catch (e) { if (mounted.current && e.name !== 'AbortError' && activeRef.current === id && viewEpoch.current === epoch) setError(e.message); } finally { pendingOperations.current--; if (mounted.current) setBusy(pendingOperations.current > 0); } }
+  function persistReading(patch, id = activeRef.current) {
+    if (!id || !readerStates.current.has(id)) return Promise.resolve(); const epoch = viewEpoch.current;
+    const previous = saveChains.current.get(id) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(async () => { const state = readerStates.current.get(id); const saved = await api('reader-state', { sessionId: id, expectedRevision: state.revision, patch }); readerStates.current.set(id, saved); return saved; });
+    saveChains.current.set(id, pending);
+    return pending.catch(e => { if (mounted.current && activeRef.current === id && viewEpoch.current === epoch) setNotice(`阅读位置尚未保存：${e.message}。当前内容仍保留，可再次保存。`); });
+  }
+  function savePosition(announce = false) {
+    if (!snapshot) return Promise.resolve();
+    const patch = { activeDocument: activeDocument === 'empty' ? null : activeDocument, viewStage, selectedLessonId: selectedId, viewedLessonIds: viewed, understoodLessonIds: understood, readerPosition: positionMetadata(reader.current?.capturePosition()), lessonScrollTop: content.current?.scrollTop ?? 0 };
+    return persistReading(patch).then(saved => { if (announce && saved && activeRef.current === snapshot.sessionId) setNotice('阅读位置已保存；仅保存位置元数据，不将源码或对话新增到浏览器存储。'); });
+  }
+  function switchSession(id) { if (id === activeId) { setCreating(false); return; } void savePosition(); setCreating(false); setActiveId(id); }
+  useEffect(() => { mounted.current = true; void loadSetup(); const media = window.matchMedia('(max-width:1100px)'); const collapse = () => { if (media.matches) setRouteOpen(false); }; collapse(); media.addEventListener('change', collapse); return () => { mounted.current = false; setupAbort.current?.abort(); snapshotAbort.current?.abort(); media.removeEventListener('change', collapse); }; }, []);
   useEffect(() => {
-    let alive = true;
-    api('list').then(value => { if (!alive) return; setListing(value); if (activeRef.current && !value.projects.some(p => p.sessions.some(s => s.id === activeRef.current))) setActiveId(''); }).catch(e => { if (alive) setError(e.message); });
-    api('models').then(value => { if (alive) setModels(value); }).catch(e => { if (alive) setNotice(`模型目录暂不可用：${e.message}`); });
-    return () => { alive = false; snapshotAbort.current?.abort(); };
-  }, []);
-  useEffect(() => {
-    localStorage.setItem('dsh-code-reading:active', activeId); setSnapshot(null); setSource(null); setResults(null); setOlderMessages([]); setWaiting(false); setTopic(''); setDraft(''); setModel(''); pendingPrompt.current = null;
-    if (activeId) refresh(activeId).then(value => { if (value && activeRef.current === activeId) { setTopic(value.topic); setRepoId(value.project.repositories[0]?.id ?? ''); } }).catch(e => setError(e.message));
-    else snapshotAbort.current?.abort();
+    try { localStorage.setItem('dsh-code-reading:active', activeId); } catch { /* Existing preference only; content belongs to Host archives. */ }
+    viewEpoch.current++; initializedView.current = null; navigation.current++; followResult.current = null; consent.current = null; restorePending.current = null; cancelAcknowledged.current = false; lastAttempt.current = null; submitting.current = null; setAccepting(false);
+    setSnapshot(null); setSnapshotState('idle'); setHistory({ sessionId: activeId, epoch: viewEpoch.current, rows: [] }); setRepoId(''); setWaiting(false); setCancelPending(false); setEntryMode('question'); setDraft(''); setModel(''); pendingPrompt.current = null;
+    setSelectedId(null); setActiveDocument('empty'); setComposerOpen(false); setViewStage('discover'); setViewed([]); setUnderstood([]); setQuestionSelection(null); setReturnPoint(null); setConfirmation(null); setDialog(''); setError(''); setNotice(''); setLastFailed(null);
   }, [activeId]);
+  useEffect(() => { setProjectOpen(false); }, [busy, ready, activeId, listing.projects.length]);
+  useEffect(() => { if (activeId && ready) void refresh(activeId).catch(e => { if (mounted.current) setError(e.message); }); else snapshotAbort.current?.abort(); }, [activeId, ready]);
+  useEffect(() => { if (snapshot && restorePending.current && reader.current) { const position = restorePending.current; restorePending.current = null; reader.current.restorePosition(position, { activate: false }); } }, [snapshot?.sessionId]);
   useEffect(() => {
-    if (!activeId || !(snapshot?.running || waiting)) return;
-    const timer = setTimeout(() => refresh(activeId).catch(e => { setError(e.message); setWaiting(false); }), 1200);
+    if (!ready || snapshotState === 'error' || !activeId || !(snapshot?.running || waiting)) return;
+    const timer = setTimeout(() => refresh(activeId).catch(e => { setError(e.message); }), 1200);
     return () => clearTimeout(timer);
-  }, [activeId, snapshot, waiting]);
-  const running = !!snapshot?.running || waiting;
-  async function send(text) {
-    const id = activeId; if (!snapshot || !text.trim()) return;
-    if (!model) throw new Error('尚未确认本会话模型，请先选择模型');
-    const [provider, modelId] = model.split('\u0000');
-    const request = pendingPrompt.current?.text === text && pendingPrompt.current.sessionId === id && pendingPrompt.current.expectedRevision === snapshot.revision && pendingPrompt.current.expectedModel.provider === provider && pendingPrompt.current.expectedModel.model === modelId ? pendingPrompt.current : { sessionId: id, requestId: uuid(), text, expectedRevision: snapshot.revision, expectedModel: { provider, model: modelId } };
-    pendingPrompt.current = request; waitingBaseline.current = snapshot.turnEnd?.seq ?? -1;
-    const accepted = await api('prompt', request); pendingPrompt.current = null;
-    if (activeRef.current === id) { setWaiting(accepted.replayed ? accepted.running : true); setDraft(''); if (accepted.replayed && !accepted.running) setNotice('此请求已经由 DSH 接纳并处理；保留原结果，不会重复阅读。'); await refresh(id); }
+  }, [activeId, snapshot, waiting, ready, snapshotState]);
+  // A change of actual provider/model or binding always invalidates consent, including A → B → A.
+  useEffect(() => { consent.current = null; setConfirmation(null); }, [scope]);
+
+  function markViewed(id, stage = viewStage) { const next = [...new Set([...viewed, id])]; setViewed(next); void persistReading({ viewStage: stage, selectedLessonId: id, viewedLessonIds: next, lessonScrollTop: 0 }); }
+  function selectLesson(lesson) { navigation.current++; setActiveDocument('reading'); rememberReadingDocument(activeId, snapshot?.topic); setSelectedId(lesson.id); setViewStage(lesson.stage); markViewed(lesson.id, lesson.stage); void persistReading({ activeDocument: 'reading' }); if (window.matchMedia('(max-width:1100px)').matches) setRouteOpen(false); if (content.current) content.current.scrollTop = 0; }
+  function toggleUnderstanding() { if (!selectedLesson) return; const next = understood.includes(selectedLesson.id) ? understood.filter(id => id !== selectedLesson.id) : [...understood, selectedLesson.id]; setUnderstood(next); void persistReading({ understoodLessonIds: next }); }
+  async function openEvidence(evidenceId) {
+    const id = activeId; const epoch = viewEpoch.current; const sequence = ++evidenceSequence.current; const route = navigation.current;
+    try { const value = await api('evidence', { sessionId: id, evidenceId }); if (activeRef.current === id && viewEpoch.current === epoch && sequence === evidenceSequence.current && route === navigation.current) reader.current?.openEvidence(value); }
+    catch (e) { if (activeRef.current === id && viewEpoch.current === epoch && sequence === evidenceSequence.current && route === navigation.current) setError(`引用无法定位：${e.message}。不会打开同名或近似文件。`); }
   }
-  async function chooseStage(stage, selectedTopic = topic) { const id = activeId; await api('stage', { sessionId: id, expectedRevision: snapshot.revision, stage, topic: selectedTopic }); if (activeRef.current === id) { setTopic(selectedTopic); await refresh(id); } }
-  async function openEvidence(evidenceId) { const id = activeId; try { const value = await api('evidence', { sessionId: id, evidenceId }); if (activeRef.current === id) setSource(value); } catch (e) { setError(e.message); } }
-  async function readMatch(match) { const id = activeId; const value = await api('read', { sessionId: id, repoId: match.repoId, path: match.path, offset: Math.max(1, (match.line ?? 1) - 8), limit: 100 }); if (activeRef.current === id) { setSource({ ...value, stale: false }); await refresh(id); } }
-  async function createProject(request) { const project = await api('create-project', request); const created = await api('create-session', { projectId: project.id }); await refreshList(); setActiveId(created.sessionId); setCreating(false); setTab('lessons'); }
-  const latest = snapshot?.state.lessons.at(-1); const topics = [...(snapshot?.state.lessons ?? [])].reverse().find(l => l.topics?.length)?.topics ?? [];
-  return <div className="cr-page" data-testid="code-reading-panel"><header className="cr-header"><BookIcon size={24} /><h1>阅读代码</h1><span className="cr-badge">仓库只读</span><span className="cr-badge">多工作区绑定</span><button type="button" disabled={busy} onClick={() => setCreating(true)}>新建阅读项目</button><button type="button" disabled={busy} onClick={() => perform(async () => { await refreshList(); if (activeId) await refresh(); })}>刷新</button></header>
-    <div className="cr-body"><aside className="cr-projects" aria-label="阅读项目"><p className="cr-muted">阅读档案独立于当前工作区</p>{listing.projects.map(project => <section className="cr-project" key={project.id}><h3>{project.title}</h3><small>{project.repositories.length} 个仓库</small>{project.sessions.map(session => <button className="cr-session" aria-current={session.id === activeId ? 'true' : undefined} type="button" key={session.id} disabled={busy} onClick={() => { setCreating(false); setActiveId(session.id); }}>{session.topic || STAGE_LABELS[session.stage]}<br /><span className="cr-muted">{new Date(session.createdAt).toLocaleString()}</span></button>)}<button className="cr-session" disabled={busy} type="button" onClick={() => perform(async () => { const value = await api('create-session', { projectId: project.id }); await refreshList(); setCreating(false); setActiveId(value.sessionId); })}>＋ 新阅读会话</button></section>)}<p className="cr-muted">固定产物目录</p><p className="cr-path">{listing.root}</p></aside>
-      <main className="cr-content">{error && <div className="cr-banner cr-error" role="alert">{error}</div>}{notice && <div className="cr-banner" role="status">{notice}<button type="button" onClick={() => setNotice('')}>关闭</button></div>}{listing.diagnostics.map((d, i) => <div className="cr-banner cr-error" key={i}>档案加载诊断：{d}</div>)}
-        {creating ? <ProjectForm workspaces={workspaces ?? []} pickDirectory={async () => { try { return await pickDirectory(); } catch (e) { setError(e.message); return null; } }} onCreate={request => perform(() => createProject(request))} busy={busy} cancel={() => setCreating(false)} /> : !activeId ? <section className="cr-empty"><h2>从业务开始，逐步看懂代码</h2><p>选择一个或多个仓库，建立有证据的阅读项目。无需修改仓库，切换普通 DSH 工作区不会改变当前阅读目标。</p><div className="cr-grid">{STAGES.map((s, i) => <div className="cr-card" key={s}><strong>{i + 1}. {STAGE_LABELS[s]}</strong></div>)}</div><button className="cr-primary" type="button" onClick={() => setCreating(true)}>创建第一个阅读项目</button><p className="cr-muted">笔记、Mermaid 源码、代码访问审计和对话记录保存在统一阅读目录。每轮一个知识点，你决定下一步。</p></section> : !snapshot ? <p role="status">正在加载阅读档案…</p> : <>
-          <h2>{snapshot.project.title}</h2><div className="cr-row">{snapshot.project.repositories.map(repo => <span className="cr-badge" title={`${repo.id}\n${repo.root}`} key={repo.id}>{repo.name}</span>)}</div><p className="cr-muted">绑定不随工作区切换 · {running ? '导师正在阅读…' : '等待你决定下一步'} · 状态版本 {snapshot.revision}</p>
-          {snapshot.archiveError && <div className="cr-banner cr-error" role="alert">归档失败：{snapshot.archiveError}。DSH 原会话仍是恢复来源；点击刷新重试，未完成归档时不要宣称已留痕。</div>}
-          <nav className="cr-stages" aria-label="阅读阶段">{STAGES.map((stage, i) => <button key={stage} type="button" disabled={busy || running} aria-current={snapshot.stage === stage ? 'step' : undefined} onClick={() => perform(() => chooseStage(stage))}>{i + 1}. {STAGE_LABELS[stage]}</button>)}</nav>
-          <div className="cr-row"><input aria-label="当前阅读主题" value={topic} onChange={e => setTopic(e.target.value)} placeholder="当前业务主题，可随时切换" maxLength={300} disabled={running} /><button type="button" disabled={busy || running} onClick={() => perform(() => chooseStage(snapshot.stage))}>应用主题</button><button type="button" disabled={busy} onClick={() => perform(async () => { const exported = await api('export', { sessionId: activeId }); setNotice(`阅读档案已导出到：${exported.path}`); })}>导出档案</button></div>
-          <div className="cr-tabs" role="tablist">{[['lessons', '知识点'], ['evidence', '代码与证据'], ['messages', '对话留痕'], ['archive', '产物与规则']].map(([id, label]) => <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => setTab(id)}>{label}</button>)}</div>
-          <Source source={source} close={() => setSource(null)} repositories={snapshot.project.repositories} />
-          {tab === 'lessons' && <>{topics.length > 0 && <section className="cr-card"><h3>选择业务主题</h3>{topics.map((item, i) => <button className="cr-question" key={i} disabled={busy || running} type="button" onClick={() => perform(() => chooseStage('business', item.title))}><strong>{item.title}</strong> — {item.description}</button>)}</section>}{snapshot.state.lessons.length === 0 && <div className="cr-card"><h3>准备就绪</h3><p>点击“开始本阶段阅读”。导师会先有限检索真实代码，展示可选业务主题，不会一次输出全部分析。</p></div>}{[...snapshot.state.lessons].reverse().map(lesson => <article className="cr-lesson" key={lesson.id}><span className="cr-muted">{STAGE_LABELS[lesson.stage]} · {lesson.topic || '发现业务'} · {new Date(lesson.createdAt).toLocaleString()}</span><h2>{lesson.title}</h2><Markdown text={lesson.markdown} openEvidence={openEvidence} />{lesson.mermaid && !lesson.markdown.includes('```mermaid') && <MermaidDiagram source={lesson.mermaid} />}<div className="cr-conclusion"><strong>本轮核心结论</strong><p>{lesson.conclusion}</p></div><details><summary>代码事实、推导与假设</summary>{lesson.claims.map((claim, i) => <div className="cr-claim" key={i}><strong>{{ fact: '代码事实', inference: '代码推导', hypothesis: '待验证假设' }[claim.kind]}</strong>{claim.text}<div className="cr-row">{claim.evidenceIds.map(id => <button type="button" key={id} onClick={() => openEvidence(id)}>{snapshot.state.evidence.find(e => e.id === id)?.path ?? id}</button>)}</div></div>)}</details>{lesson === latest && lesson.nextQuestions.map((question, i) => <button key={i} className="cr-question" disabled={busy || running} type="button" onClick={() => perform(() => send(question))}>深入：{question}</button>)}</article>)}</>}
-          {tab === 'evidence' && <section><div className="cr-row"><select aria-label="检索仓库" value={repoId} onChange={e => setRepoId(e.target.value)}>{snapshot.project.repositories.map(r => <option value={r.id} key={r.id}>{r.name}</option>)}</select><input aria-label="检索内容或路径" value={query} onChange={e => setQuery(e.target.value)} placeholder="字面量内容 / 路径子串" /><button type="button" disabled={busy} onClick={() => perform(async () => { const id = activeId; const value = await api('search', { sessionId: id, repoId, query }); if (activeRef.current === id) setResults(value); })}>搜索内容</button><button type="button" disabled={busy} onClick={() => perform(async () => { const id = activeId; const value = await api('files', { sessionId: id, repoId, filter: query }); if (activeRef.current === id) setResults(value); })}>浏览文件</button></div>{results && <div className="cr-card">{results.truncated && <p className="cr-muted">结果或扫描范围已截断，请缩小检索范围。</p>}{(results.matches ?? results.paths.map(p => ({ path: p, repoId: results.repoId }))).map((match, i) => <button className="cr-evidence" key={i} type="button" onClick={() => perform(() => readMatch(match))}>{match.path}{match.line && `:${match.line}`} {match.text && `— ${match.text}`}</button>)}</div>}<h3>本会话证据 · {snapshot.state.evidence.length}</h3><p className="cr-muted">打开时重新核验 SHA256；旧行号不静默绑定到新源码。符号是文本线索，不是 AST 解析结论。</p>{[...snapshot.state.evidence].reverse().map(evidence => <button className="cr-evidence" type="button" key={evidence.id} onClick={() => openEvidence(evidence.id)}>{snapshot.project.repositories.find(r => r.id === evidence.repoId)?.name} · {evidence.path}:{evidence.startLine}–{evidence.endLine} {evidence.symbol}<br /><span className="cr-muted">SHA256 {evidence.hash.slice(0, 16)}…</span></button>)}</section>}
-          {tab === 'messages' && <section>{snapshot.hasMoreMessages && <button type="button" onClick={() => perform(async () => { const first = (olderMessages.length ? olderMessages : snapshot.messages)[0]?.seq; const value = await api('snapshot', { sessionId: activeId, beforeSeq: first }); setOlderMessages(messages => [...value.messages, ...messages]); })}>加载更早对话</button>}{[...olderMessages, ...snapshot.messages].map(message => <article className="cr-message" key={message.seq}><header>{message.role === 'user' ? '你' : '阅读导师'} · {new Date(message.time).toLocaleString()} · DSH 序号 {message.seq}</header><Markdown text={message.text} openEvidence={openEvidence} /></article>)}</section>}
-          {tab === 'archive' && <section className="cr-card"><h3>固定产物目录</h3><p className="cr-path">{snapshot.outputDirectory}</p><ul><li>state.json：阶段、主题、绑定版本、证据和知识点索引</li><li>audit.jsonl：文件访问位置、行范围与哈希（不保存源码全文或搜索词）</li><li>notes/：每轮知识点 Markdown</li><li>diagrams/：Mermaid 原文</li><li>messages/：用户与导师的最终文本，按 DSH 事件序号留痕</li><li>exports/reading.md：汇总阅读档案</li></ul><p>源码只通过只读文件句柄访问。阅读模型不能调用 shell、写入、网络、代理或插件转调。模式不会执行项目，也不改变目标仓库；不支持链接、UNC、非 UTF-8、大于 1 MiB 的文件。</p><p>读取审计不含源码，但 DSH 工具结果、解释和笔记可能包含代码片段。使用远程模型时阅读内容会发送给所选模型提供方。固定目录不是加密保险库，也不是跨仓原子快照。</p></section>}
-          <section className="cr-composer"><label htmlFor="cr-question">提出一个问题，或先回答导师的验证场景</label><textarea id="cr-question" value={draft} onChange={e => setDraft(e.target.value)} maxLength={16000} placeholder="例如：这个订单在支付失败后如何恢复？" disabled={running} /><div className="cr-row"><button className="cr-primary" type="button" disabled={busy || running || !model} onClick={() => perform(() => send(draft.trim() || `请开始“${STAGE_LABELS[snapshot.stage]}”阶段，围绕当前主题只讲一个知识点。先取证，再归档，之后等待我决定。`))}>{draft.trim() ? '发送问题' : '开始本阶段阅读'}</button>{running && <button type="button" onClick={() => perform(async () => { await api('cancel', { sessionId: activeId }); setWaiting(false); await refresh(); })}>停止阅读</button>}<select aria-label="阅读模型" value={model} disabled={busy || running} onChange={e => { const selected = e.target.value; if (!selected) return; const [provider, modelId] = selected.split('\u0000'); perform(async () => { await api('select-model', { sessionId: activeId, provider, model: modelId }); await refresh(); }); }}><option value="">选择模型</option>{model && !models?.groups.some(group => group.models.some(item => `${group.id}\u0000${item.id}` === model)) && <option value={model}>{model.replace('\u0000', ' / ')}（当前会话）</option>}{models?.groups.flatMap(group => group.models.map(item => <option key={`${group.id}/${item.id}`} value={`${group.id}\u0000${item.id}`}>{group.name} · {item.name}</option>))}</select></div><p className="cr-muted">每轮一个知识点 · 阶段不会自动推进 · 内容通过已选择的 DSH 模型生成</p></section>
-        </>}
-      </main></div>
+  function rememberRoute() { if (returnPoint) return; setReturnPoint({ sessionId: activeId, activeDocument, selectedId, stage: viewStage, entryMode, position: reader.current?.capturePosition() ?? null, scrollTop: content.current?.scrollTop ?? 0, selection: questionSelection }); }
+  function attachSelection(selection) { rememberRoute(); setQuestionSelection(structuredClone(selection)); openReading(); setComposerOpen(true); setNotice('选区已固定到本次追问上下文；临时浏览其他文件不会替换它。'); }
+  function returnToRoute() {
+    if (!returnPoint || returnPoint.sessionId !== activeId) return;
+    navigation.current++; setSelectedId(returnPoint.selectedId); setViewStage(returnPoint.stage); setEntryMode(returnPoint.entryMode ?? 'question'); setQuestionSelection(returnPoint.selection); if (returnPoint.position) reader.current?.restorePosition(returnPoint.position, { activate: false }); else reader.current?.close(); setActiveDocument(returnPoint.activeDocument ?? 'reading'); setComposerOpen(false);
+    const top = returnPoint.scrollTop; requestAnimationFrame(() => { if (content.current) content.current.scrollTop = top; }); setReturnPoint(null); setDraft(''); setNotice('已返回原知识点和源码位置；源码版本会重新核验。');
+  }
+  async function dispatchPrompt(text, selection, initial = false, requestedStage = viewStage, retryAttempt = null, intent = 'explain') {
+    const id = activeId; const epoch = viewEpoch.current; let current = snapshot; const chosenStage = requestedStage;
+    if (!current || !text.trim() || !model) throw new Error('请填写阅读目标并选择本会话模型');
+    const [provider, modelId] = model.split('\u0000');
+    const attempt = retryAttempt ?? { sessionId: id, text, selection, initial, stage: selection ? 'deep-read' : chosenStage, readingMode: selection ? 'code' : entryMode, ...(intent === 'logic-graph' ? { intent } : {}), contextText: selectedLesson ? `\n\n本次追问的阅读上下文：主题「${topicTitle(current.topic)}」；父知识点「${selectedLesson.title}」（${selectedLesson.id}）。保留阅读主线，只处理这一轮问题。` : '' };
+    lastAttempt.current = attempt;
+    const submission = { id, epoch, cancelled: false, sent: false }; submitting.current = submission;
+    const isCurrent = () => activeRef.current === id && viewEpoch.current === epoch;
+    const cancelledBeforeSend = () => {
+      if (!submission.cancelled && isCurrent()) return false;
+      if (isCurrent()) { setWaiting(false); setAccepting(false); setCancelPending(false); setNotice('本次待提交分析已取消，尚未发送给模型。'); }
+      return true;
+    };
+    setWaiting(true); setAccepting(true); waitingBaseline.current = current.turnEnd?.seq ?? -1;
+    try {
+      let request;
+      if (attempt.uncertain && attempt.request) {
+        // An unconfirmed carrier result must replay the exact original admission, not a newly composed prompt.
+        request = attempt.request;
+        if (request.expectedModel.provider !== provider || request.expectedModel.model !== modelId) throw new Error('原请求的模型已变化，请先恢复原提供方与模型并刷新核对，不要重复创建分析。');
+      } else {
+        const desiredTopic = initial || !current.topic ? selection ? `${selection.path}:${selection.start.line}–${selection.end.line}` : text.trim().slice(0, 300) : current.topic;
+        if (current.stage !== attempt.stage || current.topic !== desiredTopic) {
+          const changed = await api('stage', { sessionId: id, expectedRevision: current.revision, stage: attempt.stage, topic: desiredTopic });
+          if (cancelledBeforeSend()) return;
+          current = { ...current, ...changed, state: { ...current.state, stage: changed.stage, topic: changed.topic, revision: changed.revision } };
+          setSnapshot(current); void refreshList().catch(() => {});
+        }
+        const payload = text + attempt.contextText;
+        const old = pendingPrompt.current;
+        request = old?.text === payload && old.readingMode === attempt.readingMode && old.intent === attempt.intent && JSON.stringify(old.selection) === JSON.stringify(selection) && old.sessionId === id && old.expectedRevision === current.revision && old.expectedModel.provider === provider && old.expectedModel.model === modelId ? old : { sessionId: id, requestId: uuid(), text: payload, readingMode: attempt.readingMode, ...(attempt.intent ? { intent: attempt.intent } : {}), expectedRevision: current.revision, expectedModel: { provider, model: modelId }, ...(selection ? { selection } : {}) };
+      }
+      if (cancelledBeforeSend()) return;
+      attempt.request = request; attempt.uncertain = false; pendingPrompt.current = request;
+      followResult.current = { id, navigation: navigation.current, lastLessonId: current.state.lessons.at(-1)?.id };
+      submission.sent = true;
+      let accepted;
+      try { accepted = await api('prompt', request); submission.settled = true; }
+      catch (e) {
+        submission.settled = true;
+        if (isCurrent()) {
+          setAccepting(false); setWaiting(false);
+          if (e.code === 'PROMPT_CANCELLED') { setCancelPending(false); setNotice('本次提问已在入队前取消，未发送给模型。'); setLastFailed(null); pendingPrompt.current = null; return; }
+          attempt.uncertain = e.code === 'NETWORK_ERROR'; setLastFailed({ ...attempt });
+        }
+        throw e;
+      }
+      pendingPrompt.current = null;
+      if (isCurrent()) {
+        setAccepting(false); setWaiting(accepted.replayed ? !!accepted.running : true); setDraft(''); setLastFailed(null);
+        if (accepted.replayed && !accepted.running) setNotice('此请求已经接纳并处理，保留原结果，不会重复阅读。');
+        // Snapshot failure is not a failed admission and must not enable a second prompt with a fresh ID.
+        await refresh(id); void refreshList().catch(() => {});
+      }
+    } catch (e) {
+      if (isCurrent() && !submission.sent) { setWaiting(false); setAccepting(false); setCancelPending(false); setLastFailed({ ...attempt }); }
+      throw e;
+    } finally { if (submitting.current === submission) submitting.current = null; }
+  }
+  function requestPrompt(text, selection = questionSelection, initial = false, stage = viewStage, retryAttempt = null, intent = 'explain') {
+    if (!text.trim() || !model || running || busy) return;
+    if (consent.current !== scope) { setConfirmation({ text, selection: selection ? structuredClone(selection) : null, initial, stage, retryAttempt, intent, scope, sessionId: activeId }); return; }
+    void perform(() => dispatchPrompt(text, selection, initial, stage, retryAttempt, intent));
+  }
+  function deepen(question) { rememberRoute(); openReading(); setComposerOpen(true); setDraft(question); setNotice('已将深入问题放入追问框。可修改后发送，或返回原阅读路线。'); }
+  async function stopAnalysis() {
+    const id = activeId; const epoch = viewEpoch.current; setCancelPending(true);
+    if (submitting.current?.id === id) submitting.current.cancelled = true;
+    try { await api('cancel', { sessionId: id }); if (activeRef.current === id && viewEpoch.current === epoch) { cancelAcknowledged.current = true; setNotice('停止请求已提交，等待后端结束；已完成内容保留。'); await refresh(id); } }
+    catch (e) { if (activeRef.current === id && viewEpoch.current === epoch) setCancelPending(false); throw e; }
+  }
+  async function createProject(request) {
+    const project = await api('create-project', request); setCreating(false);
+    try { const created = await api('create-session', { projectId: project.id }); await refreshList(); setActiveId(created.sessionId); }
+    catch (e) { await refreshList().catch(() => setListState('error')); throw new ReadingApiError(e.code ?? 'SESSION_SETUP_FAILED', `项目已保存，后续会话步骤未完成或结果未确认。请先刷新检查阅读历史，使用“新阅读会话”继续，不要重复新建项目。${e.message}`); }
+  }
+  const topics = [...(snapshot?.state.lessons ?? [])].reverse().find(lesson => lesson.topics?.length)?.topics ?? [];
+  const followText = draft.trim() || `围绕阅读主题「${topicTitle(snapshot?.topic)}」${selectedLesson ? `，接着「${selectedLesson.title}」` : ''}解释下一个相关知识点。按当前问题选择需要的业务背景、调用链或实现逻辑，不要求按固定阶段推进。先取证，发布后等待我决定。`;
+  const codeGoal = '请从我选中的代码开始，先识别并完整读取其所属方法或函数，再解释实现逻辑、项目内必要的上下游调用链和相关业务用途。代码解读的最小单元是完整方法、函数或构造器，不能把局部语句冒充完整方法；类或文件问题可按完整的更大代码单元阅读。为每个实际解读的完整代码单元归档可关联源码的结论，区分事实、推断与待确认。非代码文件不受方法粒度约束。';
+  function newReading(project = currentProject) {
+    if (!project) { setCreating(true); return; }
+    if (window.matchMedia('(max-width:1100px)').matches) setRouteOpen(false);
+    if (window.matchMedia('(max-width:900px)').matches) reader.current?.close();
+    void perform(async () => { await savePosition(); const value = await api('create-session', { projectId: project.id }); await refreshList(); setCreating(false); rememberReadingDocument(value.sessionId, '', project.id); requestedDocument.current = { id: value.sessionId, kind: 'reading' }; setActiveId(value.sessionId); });
+  }
+  const graphGoal = '请为我选中的方法或类生成逻辑图。若选区只是方法或函数的一部分，先识别并完整读取所属可调用单元，不能把局部语句当成完整方法。先读取并核验完整代码单元和必要上下文：方法优先用 Mermaid flowchart 展示入口、关键判断、分支、调用、异常与返回；类按真实职责和协作选择类图或流程图。图必须基于源码证据，区分无法确认的调用，不要臆造。将安全 Mermaid 保存到 mermaid 字段，按实际解读的完整代码单元归档结论与证据，不把类的概览等同所有方法已读；非代码文件不受方法粒度约束。不修改代码。';
+  function analyzeSelection(selection, intent = 'explain') { rememberRoute(); setQuestionSelection(structuredClone(selection)); setEntryMode('code'); requestPrompt(intent === 'logic-graph' ? graphGoal : codeGoal, selection, !hasStarted, 'deep-read', null, intent); }
+  function chooseCode() { setEntryMode('code'); setActiveDocument('source'); reader.current?.browseFiles(); }
+  const modelPicker = <ModelSelect key={activeId} value={model} groups={models?.groups} loading={modelsState === 'loading'} disabled={busy || running || modelsState === 'loading'} onValueChange={selected => {
+    if (!selected) return;
+    const [provider, modelId] = selected.split('\u0000'); const id = activeId; const epoch = viewEpoch.current; consent.current = null;
+    void perform(async () => { await api('select-model', { sessionId: id, provider, model: modelId }); if (activeRef.current === id && viewEpoch.current === epoch) await refresh(id); });
+  }} />;
+  const modelHint = model ? `会话所选模型：${model.replace('\u0000', ' / ')}。实际接收方是该提供方配置的服务端点，并非模型显示名；首次发送前请核对。` : modelsState === 'loading' ? '正在加载模型目录，请稍候。' : modelsState === 'error' ? '模型目录加载失败。请在阅读设置中重新加载。' : models?.groups.some(group => group.models.length) ? '选择本会话的提供方与模型。' : '暂无可用模型。请先在 DSH“设置 → 模型”配置提供方，再在阅读设置中重新加载。';
+  const selectionContext = questionSelection && <span className="cr-context-selection" title={`SHA256 ${questionSelection.fileHash}`}>已固定选区：{snapshot?.project.repositories.find(repo => repo.id === questionSelection.repoId)?.name} / {questionSelection.path}:{questionSelection.start.line}–{questionSelection.end.line}<button type="button" aria-label="移除提问选区" onClick={() => setQuestionSelection(null)}>×</button></span>;
+  return <div className={`cr-page cr-workbench cr-ide${routeOpen ? '' : ' cr-route-collapsed'}`} data-testid="code-reading-panel" data-has-project={!!currentProject}>
+    <header className="cr-header">
+      <span className="cr-brand-icon"><BookIcon size={20} /></span><span className="cr-app-title">阅读代码</span>
+      <div className="cr-project-switch"><Select value={currentProject?.id ?? ''} disabled={busy || !ready || !listing.projects.length} open={projectOpen && !busy && ready && !!listing.projects.length} onOpenChange={setProjectOpen} onValueChange={id => { const project = listing.projects.find(item => item.id === id); if (project?.sessions[0]) switchSession(project.sessions[0].id); else { setCreating(false); pendingProjectDialog.current = true; } }}>
+        <SelectTrigger aria-label="阅读项目切换" title={currentProject?.title}><SelectValue placeholder="选择仓库" /></SelectTrigger>
+        <SelectContent aria-label="阅读项目切换" className="cr-project-options" onCloseAutoFocus={event => { if (pendingProjectDialog.current) { pendingProjectDialog.current = false; event.preventDefault(); setDialog('projects'); } }}>{listing.projects.map(project => <SelectItem key={project.id} value={project.id}>{project.title}</SelectItem>)}</SelectContent>
+      </Select></div>
+      <span className="cr-header-repos" title={currentProject?.repositories.map(repo => repo.root).join(' / ')}>{currentProject?.repositories.length > 1 ? `${currentProject.repositories.length} 个关联仓库` : '你的代码，按你的方式读'}</span>
+      <span className="cr-badge cr-badge-safe">仓库只读</span>
+      <div className="cr-project-menu"><button type="button" aria-label="阅读菜单" aria-expanded={menuOpen} aria-controls="cr-project-actions" onClick={() => setMenuOpen(value => !value)}>更多 <span aria-hidden="true">···</span></button>{menuOpen && <div id="cr-project-actions" className="cr-menu">
+        <button type="button" disabled={busy || !ready} onClick={() => { setMenuOpen(false); newReading(); }}>新建阅读</button>
+        <button type="button" disabled={busy || !ready} onClick={() => { void savePosition(); setCreating(true); setMenuOpen(false); }}>打开其他仓库</button>
+        <button type="button" onClick={() => { setDialog('settings'); setMenuOpen(false); }}>阅读设置</button>
+        <button type="button" disabled={busy} onClick={() => { setMenuOpen(false); void perform(async () => { await loadSetup(); if (activeRef.current) await refresh(); }); }}>刷新</button>
+        <button type="button" onClick={() => { setDialog('help'); setMenuOpen(false); }}>安装与使用</button>
+      </div>}</div>
+    </header>
+    <div className="cr-body">
+
+      <FileWorkspace key={currentProject?.id || 'empty'} sessionId={activeId} repositories={snapshot?.project.repositories ?? []} repoId={repoId} onRepoChange={setRepoId} enabled={!!(ready && snapshot && !creating)} activeDocument={activeDocument} onOpen={() => { evidenceSequence.current++; navigation.current++; setActiveDocument('source'); void persistReading({ activeDocument: 'source' }); }} onController={handleController} onContextSelection={selection => { attachSelection(selection); setEntryMode('code'); }} analyzeDisabled={busy || running ? '请等待本轮结束或停止后分析' : !model ? '请先选择本会话模型' : ''} onAnalyze={selection => analyzeSelection(selection)} onGraph={selection => analyzeSelection(selection, 'logic-graph')} onReading={openReading}>
+        <FileRail />
+        <main className="cr-content cr-reading-main cr-editor-main" aria-label="文档工作区">
+          {snapshot && !creating && <DocumentTabs activeDocument={activeDocument} readingDocuments={visibleReadingDocuments} activeSessionId={activeId} onReading={document => openReading(document.sessionId)} onCloseReading={closeReadingDocument} onEmpty={() => { const document = visibleReadingDocuments.at(-1); if (document) openReading(document.sessionId); else setActiveDocument('empty'); }} />}
+          <div className="cr-editor-notices">
+            {error && <div className="cr-banner cr-error" role="alert">{error}{snapshot && <button type="button" disabled={busy} onClick={() => void perform(() => refresh())}>刷新核对状态</button>}</div>}
+            {notice && <div className="cr-banner" role="status">{notice}<button type="button" onClick={() => setNotice('')}>关闭</button></div>}
+            {listing.diagnostics.map((diagnostic, index) => <div className="cr-banner cr-error" key={index}>档案加载诊断：{diagnostic}</div>)}
+            {snapshot?.archiveError && <div className="cr-banner cr-error" role="alert">归档失败：{snapshot.archiveError}。DSH 原会话仍是恢复来源，请刷新重试。</div>}
+            {snapshot && snapshotState === 'error' && <div className="cr-banner cr-error" role="alert">状态刷新失败，已完成内容保留。运行是否结束尚未确认。<button type="button" disabled={busy} onClick={() => void perform(() => refresh())}>重新加载档案</button></div>}
+            {running && snapshot && <section className="cr-editor-task" role="status"><span className="cr-indeterminate" aria-hidden="true" /><span>{cancelPending ? '停止请求已提交，等待后端结束' : accepting ? '等待后端接纳本轮问题' : '正在分析本轮问题'}<small>代码与已有阅读内容仍可浏览</small></span><button type="button" disabled={cancelPending} onClick={() => void perform(stopAnalysis)}>{cancelPending ? '等待停止确认' : '停止分析'}</button></section>}
+          </div>
+          <div className="cr-editor-source cr-source-document" hidden={!snapshot || creating || activeDocument !== 'source'}><FileViewer /></div>
+          {snapshot && !creating && activeDocument === 'empty' && <section className="cr-editor-empty" aria-label="代码工作区空态"><span className="cr-editor-empty-symbol"><UiIcon name="file-code-2" size={38} /></span><h1>选择文件，开始阅读</h1><p>从左侧目录打开源码，在这里阅读代码。</p><div className="cr-empty-command"><span><UiIcon name="text-select" size={16} />选择方法或类</span><kbd>右键</kbd><strong>AI 生成逻辑图</strong></div><div className="cr-editor-empty-actions"><button type="button" onClick={() => reader.current?.browseFiles()}><UiIcon name="folder-tree" size={16} />浏览文件</button><button type="button" className="cr-text-button" onClick={() => openReading()}>开始问题阅读</button></div><small>阅读笔记与逻辑图也在中间打开 · 源码始终只读</small></section>}
+          <div className="cr-reading-scroll" ref={content} hidden={!!(snapshot && !creating && activeDocument !== 'reading')}>
+            {connection.state !== 'ready' && <InstallationHelp connection={connection} modelsState={modelsState} models={models} />}
+            {!ready ? <section className="cr-empty"><h2>{connection.state === 'loading' || listState === 'loading' ? '正在连接阅读插件' : '阅读项目暂不可用'}</h2><p role="status">{connection.state === 'loading' || listState === 'loading' ? '正在检查连接与仓库，不会请求模型。' : '请检查安装与连接后重试。已有记录不会因此删除。'}</p><button type="button" disabled={busy} onClick={() => void perform(loadSetup)}>重试连接与加载</button></section>
+              : creating ? <ProjectForm workspaces={workspaces ?? []} pickDirectory={async () => { try { return await pickDirectory(); } catch (e) { setError(e.message); return null; } }} onCreate={request => void perform(() => createProject(request))} busy={busy} cancel={() => setCreating(false)} />
+                : !activeId ? <section className="cr-empty cr-welcome"><span className="cr-start-symbol"><BookIcon size={28} /></span><span className="cr-eyebrow">CODE READING · 按需探索</span><h1>从一个问题，<br />或一段代码开始</h1><p>理解业务，追踪调用，读懂实现。<br />不必走固定流程，只专注你这次想弄明白的事。</p><button className="cr-primary" type="button" onClick={() => setCreating(true)}><UiIcon name="folder-tree" size={16} />打开本地仓库</button><div className="cr-welcome-notes"><span><UiIcon name="shield-check" size={15} />源码只读</span><span><UiIcon name="files" size={15} />阅读记录随时回看</span></div></section>
+                  : !snapshot && snapshotState === 'error' ? <section className="cr-empty"><h2>阅读档案加载失败</h2><p>档案没有被删除；重试只读取状态，不会重新发送问题。</p><button type="button" disabled={busy} onClick={() => void perform(() => refresh())}>重新加载档案</button></section>
+                    : !snapshot ? <p role="status">正在加载阅读档案…</p> : <>
+                      <header className="cr-topic-header"><div className="cr-breadcrumb"><UiIcon name="folder-tree" size={13} />{snapshot.project.repositories.map(repo => repo.name).join(' / ')}<span>/</span>{hasStarted ? '阅读记录' : '开始探索'}</div><div className="cr-topic-title"><h1>{topicTitle(snapshot.topic, snapshot.project.title)}</h1>{hasStarted && <button type="button" aria-label="浏览源码" onClick={() => reader.current?.browseFiles()}><UiIcon name="file-code-2" size={15} />源码</button>}</div>{hasStarted && <p className="cr-reading-meta">{snapshot.readingMode === 'code' ? '聚焦代码与上下游' : '围绕你的问题'}<span>·</span>{snapshot.state.lessons.length} 个知识点</p>}</header>
+
+                      {returnPoint && <div className="cr-return-bar"><span>原阅读位置已保留</span><button type="button" onClick={returnToRoute}>返回原阅读路线</button></div>}
+                      {!hasStarted ? <section className="cr-start">
+                        <div className="cr-entry-modes" aria-label="阅读方式"><button type="button" aria-pressed={entryMode === 'question'} onClick={() => { setEntryMode('question'); setQuestionSelection(null); }}><UiIcon name="message-square-text" size={16} />从问题出发</button><button type="button" aria-pressed={entryMode === 'code'} onClick={() => setEntryMode('code')}><UiIcon name="file-code-2" size={16} />从代码出发</button></div>
+                        <h2>{entryMode === 'code' ? '从你关心的那段代码读起' : '你想了解什么？'}</h2><p>{entryMode === 'code' ? '选择一个文件，框选代码。先读逻辑，再看它在项目中的调用链和业务作用。' : '说说业务问题、功能或困惑，阅读会围绕你的目标展开。'}</p>
+                        {entryMode === 'code' && !questionSelection ? <div className="cr-code-entry"><span className="cr-code-entry-icon"><UiIcon name="text-select" size={29} /></span><strong>把代码作为起点，而不是整个仓库</strong><p>在源码中选择代码后，使用“让 AI 分析选中代码”。</p><button type="button" className="cr-primary" onClick={chooseCode}><UiIcon name="folder-tree" size={16} />选择代码</button></div> : <form onSubmit={event => { event.preventDefault(); if (!busy && model && (draft.trim() || questionSelection)) lastFailed ? requestPrompt(lastFailed.text, lastFailed.selection, lastFailed.initial, lastFailed.stage, lastFailed) : requestPrompt(draft.trim() || codeGoal, questionSelection, true, questionSelection ? 'deep-read' : 'business'); }}>
+                          {questionSelection && <div className="cr-context">{selectionContext}</div>}
+                          <label htmlFor="cr-reading-goal" className="cr-sr-only">阅读目标</label><textarea id="cr-reading-goal" aria-label="阅读目标" maxLength={16000} rows={4} value={draft} onChange={event => { setDraft(event.target.value); setLastFailed(null); }} placeholder={questionSelection ? '你想特别了解这段代码的什么？（可选）' : '例如：用户提交订单后，系统是怎样完成支付的？'} />
+                          {!questionSelection && <div className="cr-start-shortcuts">{[['了解整体业务', '这个仓库解决什么业务问题？请从核心功能和真实入口开始解释。'], ['寻找功能入口', '我想找到主要功能的真实代码入口，并理解它们分别解决什么问题。']].map(([label, text]) => <button type="button" key={label} onClick={() => { setDraft(text); setLastFailed(null); }}>{label}<span aria-hidden="true"> ↗</span></button>)}</div>}
+                          <div className="cr-start-actions"><div className="cr-model-compact">{activeDocument === 'reading' && modelPicker}</div><button className="cr-primary" type="submit" disabled={busy || !model || (!draft.trim() && !questionSelection)}>{lastFailed ? '重试本次分析' : '开始阅读'}<UiIcon name="chevron-right" size={15} /></button></div>
+                        </form>}
+                        {activeDocument === 'reading' && entryMode === 'code' && !questionSelection && <div className="cr-code-model">{modelPicker}</div>}
+                        <p id="cr-model-hint" className={model ? 'cr-sr-only' : 'cr-muted'} role="status">{modelHint}</p><div className="cr-start-footnote"><span id="cr-privacy"><UiIcon name="shield-check" size={13} />源码只读，发送前确认范围</span><button className="cr-text-button" type="button" onClick={() => setDialog('settings')}>阅读设置</button></div>
+                      </section> : selectedLesson ? <LessonArticle key={selectedLesson.id} lesson={selectedLesson} evidence={snapshot.state.evidence} repositories={snapshot.project.repositories} Markdown={Markdown} openEvidence={openEvidence} understood={understood.includes(selectedLesson.id)} onUnderstand={toggleUnderstanding} onDeepen={deepen} disabled={busy || running} /> : !running && <section className="cr-result-empty"><UiIcon name="message-square-text" size={24} /><h2>还没有生成阅读内容</h2><p className="cr-muted">可以调整下面的问题后重试。原问题和已保存的位置都还在。</p></section>}
+                      {hasStarted && topics.length > 0 && <details className="cr-topic-candidates"><summary>还可以了解 · {topics.length}</summary>{topics.map((item, index) => <button className="cr-question" type="button" key={index} disabled={busy || running} onClick={() => deepen(item.title)}><strong>{item.title}</strong><small>{item.description}</small></button>)}</details>}
+                      {hasStarted && <details className="cr-inline-transcript"><summary>历史追问与对话记录</summary><p className="cr-muted">{selectedLesson?.turn !== undefined ? '以下仅展示与此知识点同一轮的归档消息。' : '旧记录没有可靠的父知识点关联，保留为会话记录，不推断关联。'}</p><Transcript messages={[...olderMessages, ...snapshot.messages].filter(message => selectedLesson?.turn === undefined || message.turn === selectedLesson.turn)} Markdown={Markdown} openEvidence={openEvidence} /><button type="button" onClick={() => setDialog('messages')}>对话记录</button></details>}
+                    </>}
+          </div>
+          {snapshot && !creating && hasStarted && activeDocument === 'reading' && <section className="cr-composer">
+            <button className="cr-composer-toggle" type="button" aria-expanded={composerOpen} onClick={() => setComposerOpen(value => !value)}><UiIcon name="message-square-text" size={15} />追问当前知识点<span aria-hidden="true">{composerOpen ? '−' : '+'}</span></button>
+            <div className="cr-composer-input" hidden={!composerOpen}>
+            {questionSelection && <div className="cr-context" aria-label="本次提问上下文">{selectionContext}</div>}
+            <label htmlFor="cr-question">追问当前知识点</label><textarea id="cr-question" aria-label="追问当前知识点" value={draft} onChange={event => setDraft(event.target.value)} maxLength={15000} rows={2} placeholder="继续追问，或选择一段代码深入…" disabled={running} onKeyDown={event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); requestPrompt(followText); } }} />
+            </div>
+            <div className="cr-composer-actions"><div className="cr-model-compact">{modelPicker}<button type="button" aria-label="阅读设置" onClick={() => setDialog('settings')}>设置</button></div>{!running && <button className="cr-primary" type="button" disabled={busy || !model || snapshotState === 'error'} onClick={() => requestPrompt(followText)}>{draft.trim() ? '发送问题' : '继续阅读'}<UiIcon name="chevron-right" size={14} /></button>}</div>
+            <p id="cr-model-hint" className="cr-sr-only">{modelHint}</p><p id="cr-privacy" className="cr-sr-only">源码与问题可能发送至所选提供方配置的服务端点，首次调用或范围变化需确认。</p>{lastFailed && !running && <button type="button" className="cr-retry" disabled={busy} onClick={() => requestPrompt(lastFailed.text, lastFailed.selection, lastFailed.initial, lastFailed.stage, lastFailed)}>重试本次分析</button>}
+          </section>}
+          {snapshot && !creating && activeDocument !== 'reading' && <footer className="cr-editor-statusbar"><span className="cr-editor-readonly"><UiIcon name="shield-check" size={13} />只读</span><div className="cr-editor-model">{modelPicker}</div><button type="button" className="cr-text-button" onClick={() => setDialog('settings')}>阅读设置</button><button type="button" className="cr-text-button" onClick={() => openReading()}>问题阅读</button></footer>}
+        </main>
+      <aside className="cr-projects cr-route cr-reading-sidebar" aria-label="阅读列表">
+        <div className="cr-route-toolbar"><strong>阅读列表</strong><button type="button" aria-label={routeOpen ? '收起列表' : '展开列表'} title={routeOpen ? '收起列表' : '展开列表'} aria-expanded={routeOpen} onClick={() => setRouteOpen(value => !value)}><UiIcon name={routeOpen ? 'chevron-right' : 'chevron-left'} /></button></div>
+        <div className="cr-route-inner">
+          <button className="cr-new-reading" type="button" disabled={busy || !ready} onClick={() => newReading()}><span aria-hidden="true">＋</span> 新建阅读</button>
+          <div className="cr-history">
+            {!listing.projects.length && <p className="cr-list-empty">还没有阅读记录。<br />打开一个仓库，从感兴趣的地方开始。</p>}
+            {listing.projects.map(project => <section className="cr-project" key={project.id}>
+              <h3><UiIcon name="folder-tree" size={14} /><span title={project.repositories.map(repo => repo.root).join(' / ')}>{project.title}</span></h3>
+              {project.sessions.map(session => <React.Fragment key={session.id}>
+                <button className="cr-session" aria-current={session.id === activeId && !creating ? 'true' : undefined} type="button" disabled={busy} onClick={() => openReading(session.id)}><span className="cr-session-title">{topicTitle(session.topic, '新的阅读')}</span><small>{(session.id === snapshot?.sessionId ? snapshot.readingMode : session.readingMode) === 'code' ? '代码阅读' : '问题阅读'}<span aria-hidden="true"> · </span>{new Date(session.createdAt).toLocaleDateString()}</small></button>
+                {snapshot?.sessionId === session.id && !creating && <ReadingRoute snapshot={snapshot} selectedId={selectedId} viewed={viewed} understood={understood} onLesson={selectLesson} />}
+              </React.Fragment>)}
+              {!project.sessions.length && <button className="cr-new-session" disabled={busy || !ready} type="button" onClick={() => newReading(project)}>＋ 新阅读会话</button>}
+            </section>)}
+          </div>
+        </div>
+        {snapshot && !creating && <div className="cr-route-footer"><button type="button" onClick={() => setDialog('artifacts')}><UiIcon name="files" size={14} />阅读产物</button><button type="button" title="保存阅读位置" aria-label="保存阅读位置" disabled={busy} onClick={() => void savePosition(true)}><UiIcon name="text-select" size={15} /></button></div>}
+      </aside>
+      </FileWorkspace>
+    </div>
+    {confirmation && <ReadingDialog title="确认源码发送范围" onClose={() => setConfirmation(null)}><p>本次所选模型：<strong>{model.replace('\u0000', ' / ')}</strong></p><p>实际数据接收方为提供方 <strong>{model.split('\u0000')[0]}</strong> 在 DSH 中配置的服务端点。当前接口未返回端点或部署位置，请在 DSH 模型设置中核对；不要仅凭名称判断是否本地。</p><h3>本轮允许读取的绑定仓库</h3><ul>{snapshot?.project.repositories.map(repo => <li key={repo.id}>{repo.name}<small className="cr-path">{repo.root}</small></li>)}</ul><p>阅读模型可在这些已有绑定内按需只读取证。读到的源码片段、你的问题及会话上下文可能随模型请求发送；本确认不扩大后端读取权限。</p><p className="cr-muted">代码解读会从选区扩展到其所属完整方法／函数或更大代码单元，并按需读取上下文；非代码文件不受方法粒度约束。范围由模型识别，归档时核验源码版本、行列和读取证据。</p>{confirmation.selection && <p className="cr-selected-hint">本次明确选区：{confirmation.selection.path}:{confirmation.selection.start.line}–{confirmation.selection.end.line} · SHA256 {confirmation.selection.fileHash.slice(0, 16)}…</p>}<p className="cr-muted">仅本页面当前会话与当前提供方、模型和绑定范围有效。本确认不代替 DSH 自身可能显示的权限提示。</p><div className="cr-row"><button type="button" onClick={() => setConfirmation(null)}>暂不发送</button><button type="button" className="cr-primary" onClick={() => { const request = confirmation; setConfirmation(null); if (request.scope !== scope || request.sessionId !== activeRef.current) { setError('模型或主题已经变化，请重新确认。'); return; } consent.current = scope; void perform(() => dispatchPrompt(request.text, request.selection, request.initial, request.stage, request.retryAttempt, request.intent)); }}>确认并开始阅读</button></div></ReadingDialog>}
+    {dialog && <ReadingDialog title={{ settings: '阅读设置', artifacts: '阅读产物', messages: '对话记录', help: '安装与使用', projects: '阅读仓库' }[dialog]} onClose={() => setDialog('')}>
+      {dialog === 'help' && <InstallationHelp connection={connection} modelsState={modelsState} models={models} />}
+      {dialog === 'settings' && <><h3>模型与提供方</h3><p className="cr-muted">{modelHint}</p><button type="button" disabled={busy || running || modelsState === 'loading'} onClick={() => void perform(() => refreshModels(setupAbort.current?.signal))}>重新加载模型目录</button>{models?.failures?.length > 0 && <p className="cr-banner">{models.failures.length} 个提供方暂不可用，不会自动切换提供方。</p>}<h3>绑定仓库</h3><p>阅读记录固定关联这些仓库，不随普通工作区切换。需要新增仓库时，打开其他仓库开始新的阅读。</p>{currentProject?.repositories.map(repo => <p className="cr-path" key={repo.id}>{repo.name}<br />{repo.root}</p>)}<h3>按需阅读</h3><p>从业务或问题出发时，按需要解释业务、调用关系与关键实现；从代码出发时，聚焦选区、上下游和代码逻辑。理解自查只在你需要时展开，不必依次完成任何阶段。</p><p>仓库只读。不执行项目、脚本、终端、自动修改代码或额外网络工具。每轮一个知识点，下一步由你决定。</p><p>证据以读取时的文件 SHA256 关联，不是 Git 提交或跨仓快照。打开时重新核验；源码变化后旧引用不可视为有效，没有历史源码快照恢复能力。</p><h3>档案位置与诊断</h3><p className="cr-path">{snapshot?.outputDirectory || listing.root}</p><p className="cr-muted">内部状态版本：{snapshot?.revision ?? '尚未加载'}（不是 Git 版本）</p><button type="button" onClick={() => setDialog('help')}>安装与使用</button></>}
+      {dialog === 'artifacts' && <><p>已归档的知识点、调用图、对话与人工批注保留在阅读目录，不写回源码仓库。</p><ul><li>{snapshot?.state.lessons.length ?? 0} 个知识点 · Markdown</li><li>{snapshot?.state.evidence.length ?? 0} 条源码证据 · 路径、行号与 SHA256</li><li>Mermaid 图源码、问答、访问审计与人工批注</li></ul><button type="button" className="cr-primary" disabled={busy} onClick={() => void perform(async () => { const id = activeId; const epoch = viewEpoch.current; const exported = await api('export', { sessionId: id }); if (activeRef.current === id && viewEpoch.current === epoch) setNotice(`阅读档案已导出到：${exported.path}`); })}>导出档案</button><p className="cr-muted">导出仅写入阅读档案目录。记录可能含代码片段，请按项目敏感级别管理。</p><details><summary>产物目录与格式</summary><p className="cr-path">{snapshot?.outputDirectory}</p><ul><li>state.json：阅读状态与证据索引</li><li>notes/ 与 diagrams/：知识点与图源码</li><li>messages/ 与 audit.jsonl：问答与访问审计</li><li>annotations.json：人工批注与版本历史</li><li>exports/reading.md：汇总导出</li></ul></details></>}
+      {dialog === 'messages' && <>{snapshot?.hasMoreMessages && <button type="button" disabled={busy} onClick={() => void perform(loadOlderMessages)}>加载更早对话</button>}<Transcript messages={[...olderMessages, ...(snapshot?.messages ?? [])]} Markdown={Markdown} openEvidence={id => { setDialog(''); void openEvidence(id); }} /></>}
+      {dialog === 'projects' && listing.projects.map(project => <section key={project.id}><h3>{project.title}</h3><button type="button" disabled={busy} onClick={() => { setDialog(''); newReading(project); }}>＋ 新阅读会话</button></section>)}
+    </ReadingDialog>}
   </div>;
 }
 export function apply(ctx) {

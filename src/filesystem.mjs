@@ -12,7 +12,7 @@ export function contains(parent, child) { const rel = path.relative(normalized(p
 export function assertDisjoint(a, b) { if (contains(a, b) || contains(b, a)) fail('STORAGE_OVERLAP', '阅读产物目录与仓库必须互不嵌套；不能将用户目录或产物目录绑定为仓库'); }
 export function safeRelative(input) {
   if (typeof input !== 'string' || !input || input.length > 1024 || /[\\:\x00-\x1f]/.test(input) || input.startsWith('/') || input.split('/').some(p => !p || p === '.' || p === '..' || /[. ]$/.test(p) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p))) fail('PATH_DENIED', '仅允许仓库相对路径，使用 / 分隔；禁止穿越、设备路径和 ADS');
-  if (input.split('/').some(p => SKIP.has(p) || /^\.env(?:\.|$)/i.test(p) || /^(id_rsa|id_ed25519|credentials)(?:\.|$)/i.test(p))) fail('SENSITIVE_PATH', '默认不读取依赖、构建目录或敏感配置文件');
+  if (input.split('/').some(p => SKIP.has(p.toLowerCase()) || /^\.env(?:\.|$)/i.test(p) || /^(id_rsa|id_ed25519|credentials)(?:\.|$)/i.test(p))) fail('SENSITIVE_PATH', '默认不读取依赖、构建目录或敏感配置文件');
   return input;
 }
 function identity(stat) { return { dev: String(stat.dev), ino: String(stat.ino) }; }
@@ -71,6 +71,20 @@ export async function readRepository(binding, input, options = {}) {
     return { hash: digest(bytes), bytes: length, lines: text.split(/\r\n|\n|\r/), text };
   } finally { await handle.close(); }
 }
+export async function listDirectory(binding, directory = '', offset = 0, limit = 200, signal) {
+  if (directory) safeRelative(directory); await checkBinding(binding);
+  const absolute = path.resolve(binding.root, ...directory.split('/').filter(Boolean)); if (!contains(binding.root, absolute)) fail('PATH_DENIED', '目录超出绑定仓库'); await checkPlain(absolute);
+  const entries = []; let visited = 0; let budgetTruncated = false;
+  const handle = await fs.opendir(absolute);
+  for await (const entry of handle) {
+    signal?.throwIfAborted(); if (++visited > LIMITS.scanFiles) { budgetTruncated = true; break; }
+    if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) continue;
+    const relative = directory ? `${directory}/${entry.name}` : entry.name; try { safeRelative(relative); } catch { continue; }
+    entries.push({ name: entry.name, path: relative, kind: entry.isDirectory() ? 'directory' : 'file' });
+  }
+  await checkBinding(binding); entries.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'directory' ? -1 : 1) || a.name.localeCompare(b.name));
+  return { directory, entries: entries.slice(offset, offset + limit), nextOffset: offset + limit < entries.length ? offset + limit : null, truncated: budgetTruncated || offset + limit < entries.length, budgetTruncated, visited };
+}
 export async function listRepository(binding, signal) {
   await checkBinding(binding);
   const stack = ['']; const files = []; let visited = 0;
@@ -94,7 +108,7 @@ export async function listRepository(binding, signal) {
   return { files: files.sort(), truncated: stack.length > 0 || visited >= LIMITS.scanFiles, visited };
 }
 export async function ensurePlainDirectory(directory) { await checkPlain(directory, true); await fs.mkdir(directory, { recursive: true, mode: 0o700 }); await checkPlain(directory); }
-export async function atomicText(target, content, maxBytes = LIMITS.stateBytes) {
+export async function atomicText(target, content, maxBytes = LIMITS.stateBytes, beforeCommit) {
   if (Buffer.byteLength(content) > maxBytes) fail('STORAGE_LIMIT', '产物超出大小限制，请新建阅读会话');
   await checkPlain(path.dirname(target));
   try { if ((await fs.lstat(target)).isSymbolicLink()) fail('LINK_DENIED', '产物目标不能为符号链接'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -102,6 +116,7 @@ export async function atomicText(target, content, maxBytes = LIMITS.stateBytes) 
   const handle = await fs.open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
   try { await handle.writeFile(content, 'utf8'); await handle.sync(); } finally { await handle.close(); }
   await checkPlain(path.dirname(target));
+  beforeCommit?.();
   await fs.rename(temp, target);
 }
 export async function appendAudit(target, record) {

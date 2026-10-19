@@ -7,7 +7,9 @@ let queue = Promise.resolve();
 export async function renderDiagramDocument(source) {
   validateMermaid(source);
   const task = queue.catch(() => {}).then(async () => {
-    mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'neutral', maxTextSize: 10000, maxEdges: 120, flowchart: { htmlLabels: false } });
+    // Mermaid 11 prioritizes the root option; diagram-only htmlLabels is deprecated.
+    // Render native SVG text so the foreignObject ban cannot strip node labels.
+    mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: 'neutral', maxTextSize: 10000, maxEdges: 120, htmlLabels: false, flowchart: { htmlLabels: false } });
     const container = document.createElement('div');
     container.style.cssText = 'position:fixed;left:-100000px;top:0;pointer-events:none';
     document.body.appendChild(container);

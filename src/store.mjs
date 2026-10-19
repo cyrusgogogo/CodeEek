@@ -1,12 +1,17 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createProjectSchema, readSchema, filesSchema, searchSchema, publishSchema, changeStageSchema, idSchema, STAGE_LABELS, validateMermaid, fail } from './contracts.mjs';
-import { bindDirectory, checkBinding, checkPlain, assertDisjoint, contains, readRepository, listRepository, ensurePlainDirectory, atomicText, appendAudit, digest } from './filesystem.mjs';
+import { createProjectSchema, readSchema, filesSchema, searchSchema, publishSchema, changeStageSchema, readerStateSchema, updateReaderStateSchema, readingModeSchema, promptIntentSchema, idSchema, STAGE_LABELS, validateMermaid, fail } from './contracts.mjs';
+import { bindDirectory, checkBinding, checkPlain, assertDisjoint, contains, safeRelative, readRepository, listRepository, ensurePlainDirectory, atomicText, appendAudit, digest } from './filesystem.mjs';
 
+import { loadAnnotations } from './workspace.mjs';
+import { annotationMarkdown } from './anchors.mjs';
+import { parseReadingFocus, restoredCodeUnits, verifyCodeUnits, codeUnitsMarkdown } from './code-units.mjs';
 const makeId = prefix => `${prefix}-${randomUUID()}`;
 const clone = value => structuredClone(value);
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
+const directoryName = (root, max) => (path.basename(root).trim() || path.parse(root).root || 'repository').slice(0, max);
+const sectionMarkdown = (lesson, depth) => lesson.sections?.length ? `\n\n${'#'.repeat(depth)} 内容维度归档\n${lesson.sections.map(section => `\n${'#'.repeat(depth + 1)} ${STAGE_LABELS[section.dimension]}\n\n${section.markdown}\n`).join('')}` : '';
 const RUNTIME_KEY = Symbol.for('dsh-code-reading.runtime.v1');
 const RUNTIMES = globalThis[RUNTIME_KEY] ??= new WeakMap();
 export function peekRuntime(root) { return RUNTIMES.get(root); }
@@ -34,6 +39,15 @@ export class ReadingStore {
           const stateFile = path.join(dir, folder.name, 'state.json'); await checkPlain(stateFile);
           const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
           if (state.id !== folder.name || state.projectId !== project.id || !Number.isSafeInteger(state.revision) || !Array.isArray(state.evidence) || !Array.isArray(state.lessons) || !Array.isArray(state.messageRefs)) fail('CORRUPT_SESSION', '阅读会话档案无效');
+          state.readerState = this.restoredReaderState(state);
+          state.readingMode = readingModeSchema.safeParse(state.readingMode).data ?? 'question';
+          state.intent = promptIntentSchema.safeParse(state.intent).data ?? 'explain';
+          try { state.readingFocus = parseReadingFocus(state.readingFocus ?? null, project); } catch { state.readingFocus = null; }
+          state.readingModeRevision = Number.isSafeInteger(state.readingModeRevision) && state.readingModeRevision >= 0 ? state.readingModeRevision : 0;
+          for (const lesson of state.lessons) {
+            lesson.sections ??= []; lesson.codeUnits = restoredCodeUnits(lesson.codeUnits); lesson.intent = promptIntentSchema.safeParse(lesson.intent).data ?? 'explain';
+            try { lesson.readingFocus = parseReadingFocus(lesson.readingFocus ?? null, project); } catch { lesson.readingFocus = null; }
+          }
           this.sessions.set(state.id, state);
         }
       } catch (error) { this.diagnostics.push(`${entry.name}: ${error.message}`); }
@@ -56,7 +70,53 @@ export class ReadingStore {
     if (!contains(this.root, directory)) fail('OUTPUT_DENIED', '产物路径超出固定阅读目录');
     await ensurePlainDirectory(directory); await checkBinding(this.storageBinding);
   }
-  async saveState(state) { const dir = this.sessionDir(state.id); await this.writable(dir); await atomicText(path.join(dir, 'state.json'), json(state)); this.sessions.set(state.id, clone(state)); }
+  restoredReaderState(state) {
+    const saved = state.readerState ?? {};
+    const candidate = saved && typeof saved === 'object' && !Array.isArray(saved) ? { ...saved, activeDocument: ['source', 'reading'].includes(saved.activeDocument) ? saved.activeDocument : null } : saved;
+    const parsed = readerStateSchema.safeParse(candidate);
+    if (!parsed.success) { this.diagnostics.push(`${state.id}: 阅读位置元数据无效，已使用默认位置`); return readerStateSchema.parse({}); }
+    const value = parsed.data; const lessons = new Set(state.lessons.map(lesson => lesson.id));
+    value.selectedLessonId = lessons.has(value.selectedLessonId) ? value.selectedLessonId : null;
+    value.viewedLessonIds = [...new Set(value.viewedLessonIds)].filter(id => lessons.has(id));
+    value.understoodLessonIds = [...new Set(value.understoodLessonIds)].filter(id => lessons.has(id));
+    if (value.readerPosition) {
+      try { if (!this.project(state.projectId).repositories.some(repo => repo.id === value.readerPosition.repoId)) fail('REPO_NOT_BOUND', '仓库未绑定'); safeRelative(value.readerPosition.path); }
+      catch { value.readerPosition = null; }
+    }
+    return value;
+  }
+  async updateReaderState(raw, guard) {
+    const args = updateReaderStateSchema.parse(raw);
+    return this.lock(args.sessionId, async () => {
+      guard?.(); const state = clone(this.session(args.sessionId)); const previous = this.restoredReaderState(state);
+      if (previous.revision !== args.expectedRevision) fail('STALE_READER_STATE', '阅读位置已由另一页面更新，请刷新后再保存');
+      const next = readerStateSchema.parse({ ...previous, ...args.patch });
+      const lessons = new Set(state.lessons.map(lesson => lesson.id));
+      for (const id of [next.selectedLessonId, ...next.viewedLessonIds, ...next.understoodLessonIds].filter(Boolean)) if (!lessons.has(id)) fail('LESSON_NOT_FOUND', '知识点不属于当前阅读会话');
+      next.viewedLessonIds = [...new Set(next.viewedLessonIds)]; next.understoodLessonIds = [...new Set(next.understoodLessonIds)];
+      if (next.readerPosition) { this.repo(state.id, next.readerPosition.repoId); safeRelative(next.readerPosition.path); }
+      if (JSON.stringify(next) === JSON.stringify(previous)) return clone(previous);
+      if (previous.revision >= Number.MAX_SAFE_INTEGER) fail('READER_STATE_LIMIT', '阅读位置版本达到上限，请新建会话');
+      next.revision++; state.readerState = next;
+      await this.audit(state.id, 'reader-state-save-attempt', { revision: next.revision, fields: Object.keys(args.patch) });
+      guard?.(); await this.saveState(state, guard); return clone(next);
+    });
+  }
+  async updateReadingMode(id, mode, guard, intent, focus) {
+    if (mode !== undefined) readingModeSchema.parse(mode);
+    if (intent !== undefined) promptIntentSchema.parse(intent);
+    return this.lock(id, async () => {
+      guard?.(); const state = clone(this.session(id)); const next = mode ?? state.readingMode ?? 'question'; const nextIntent = intent ?? state.intent ?? 'explain';
+      const nextFocus = focus === undefined ? state.readingFocus ?? null : parseReadingFocus(focus, this.project(state.projectId));
+      const changedMode = state.readingMode !== next;
+      if (!changedMode && state.intent === nextIntent && JSON.stringify(state.readingFocus ?? null) === JSON.stringify(nextFocus)) return next;
+      if (changedMode && state.readingModeRevision >= Number.MAX_SAFE_INTEGER) fail('READING_MODE_LIMIT', '阅读模式版本达到上限，请新建会话');
+      state.readingMode = next; state.intent = nextIntent; state.readingFocus = nextFocus; state.readingModeRevision = (state.readingModeRevision ?? 0) + Number(changedMode);
+      await this.audit(id, 'reading-mode-save-attempt', { readingMode: next, readingModeRevision: state.readingModeRevision, intent: nextIntent, hasReadingFocus: !!nextFocus });
+      await this.saveState(state, guard); return next;
+    });
+  }
+  async saveState(state, guard) { const dir = this.sessionDir(state.id); await this.writable(dir); guard?.(); await atomicText(path.join(dir, 'state.json'), json(state), undefined, guard); this.sessions.set(state.id, clone(state)); }
   async audit(id, action, fields = {}) { const dir = this.sessionDir(id); await this.writable(dir); await appendAudit(path.join(dir, 'audit.jsonl'), { time: new Date().toISOString(), projectId: this.session(id).projectId, sessionId: id, action, ...fields }); }
   async createProject(raw) {
     const request = createProjectSchema.parse(raw);
@@ -65,9 +125,9 @@ export class ReadingStore {
       for (const input of request.repositories) {
         const binding = await bindDirectory(input.path); assertDisjoint(this.root, binding.root);
         for (const previous of repositories) if (contains(previous.root, binding.root) || contains(binding.root, previous.root)) fail('DUPLICATE_REPOSITORY', '同一个阅读项目中的仓库必须互不嵌套且不能重复');
-        repositories.push({ id: makeId('repo'), name: input.name, ...binding, ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}) });
+        repositories.push({ id: makeId('repo'), name: input.name || directoryName(binding.root, 60), ...binding, ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}) });
       }
-      const project = { id: makeId('project'), title: request.title, createdAt: new Date().toISOString(), bindingRevision: 1, repositories };
+      const project = { id: makeId('project'), title: request.title || directoryName(repositories[0].root, 120), createdAt: new Date().toISOString(), bindingRevision: 1, repositories };
       const dir = this.projectDir(project.id); await this.writable(dir);
       await ensurePlainDirectory(path.join(dir, 'sessions')); await atomicText(path.join(dir, 'project.json'), json(project));
       this.projects.set(project.id, project); return clone(project);
@@ -75,12 +135,12 @@ export class ReadingStore {
   }
   async createSession(projectId) {
     const project = this.project(projectId); for (const repo of project.repositories) await checkBinding(repo);
-    const state = { id: makeId('reading'), projectId, revision: 1, stage: 'discover', topic: '', createdAt: new Date().toISOString(), evidence: [], lessons: [], messageRefs: [], archiveSeq: -1, stageHistory: [{ revision: 1, stage: 'discover', topic: '', time: new Date().toISOString() }], publishReceipts: {} };
+    const state = { id: makeId('reading'), projectId, revision: 1, stage: 'discover', topic: '', readingMode: 'question', readingModeRevision: 0, intent: 'explain', readingFocus: null, readerState: readerStateSchema.parse({}), createdAt: new Date().toISOString(), evidence: [], lessons: [], messageRefs: [], archiveSeq: -1, stageHistory: [{ revision: 1, stage: 'discover', topic: '', time: new Date().toISOString() }], publishReceipts: {} };
     this.sessions.set(state.id, state);
     try { for (const dir of ['', 'notes', 'diagrams', 'messages', 'exports']) await this.writable(path.join(this.sessionDir(state.id), dir)); await this.saveState(state); await this.audit(state.id, 'session-created', { bindingRevision: project.bindingRevision }); return clone(state); } catch (error) { this.sessions.delete(state.id); throw error; }
   }
-  list() { return { root: this.root, diagnostics: [...this.diagnostics], projects: [...this.projects.values()].map(p => ({ ...clone(p), sessions: [...this.sessions.values()].filter(s => s.projectId === p.id).map(s => ({ id: s.id, stage: s.stage, topic: s.topic, createdAt: s.createdAt, revision: s.revision })) })) }; }
-  catalog(id) { const state = this.session(id); return { sessionId: id, project: clone(this.project(state.projectId)), stage: state.stage, topic: state.topic, revision: state.revision, outputDirectory: this.sessionDir(id), limits: { fileBytes: 1048576, evidence: 500, lessons: 100 }, instructions: '每次显式指定 repoId。阶段只能由用户改变；发布一个知识点后等待用户。' }; }
+  list() { return { root: this.root, diagnostics: [...this.diagnostics], projects: [...this.projects.values()].map(p => ({ ...clone(p), sessions: [...this.sessions.values()].filter(s => s.projectId === p.id).map(s => ({ id: s.id, stage: s.stage, topic: s.topic, readingMode: s.readingMode ?? 'question', intent: s.intent ?? 'explain', createdAt: s.createdAt, revision: s.revision })) })) }; }
+  catalog(id) { const state = this.session(id); return { sessionId: id, project: clone(this.project(state.projectId)), stage: state.stage, topic: state.topic, revision: state.revision, readingMode: state.readingMode ?? 'question', readingModeRevision: state.readingModeRevision ?? 0, intent: state.intent ?? 'explain', readingFocus: clone(state.readingFocus ?? null), outputDirectory: this.sessionDir(id), limits: { fileBytes: 1048576, evidence: 500, lessons: 100 }, instructions: '每次显式指定 repoId。readingMode 是阅读起点，本轮明确意图优先；选区始终从 code 阅读开始。intent 仅标识本轮：logic-graph 必须围绕当前已核验选区生成有证据的逻辑图，explain 不强制绘图。代码归档 codeUnits 最少完整方法/函数，必要时完整类或整文件；先连续读取完整范围，保留 UTF16 start/end 排他坐标、哈希、结论和覆盖证据。本轮 readingFocus 若为代码须被单元完整包含，不可因 claims 漏写选区而跳过。语义边界由 AI 据语言识别，Host 只核验字节/坐标/证据覆盖，非通用 AST。明确文档/数据路径可豁免；未知扩展仍按代码。stage 仅保留兼容状态；五个维度按问题需要组合，没有固定顺序。discover 仅用于模糊宽泛目标，verify 仅用户明确要求时使用；发布一个知识点后等待用户。' }; }
   async read(id, raw, signal) {
     const args = readSchema.parse(raw);
     return this.lock(id, async () => {
@@ -140,26 +200,59 @@ export class ReadingStore {
     const args = publishSchema.parse(raw); const mermaid = validateMermaid(args.mermaid);
     return this.lock(id, async () => {
       const state = clone(this.session(id));
-      const payloadHash = digest(JSON.stringify(args));
+      // Empty additive defaults must not change old publication receipt bytes.
+      const { sections, codeUnits, ...legacyPayload } = args;
+      const payloadHash = digest(JSON.stringify({ ...legacyPayload, ...(sections.length ? { sections } : {}), ...(codeUnits.length ? { codeUnits } : {}) }));
       if (receipt && state.publishReceipts[receipt]) {
         const saved = state.publishReceipts[receipt];
         if (saved.payloadHash !== payloadHash) fail('RECEIPT_CONFLICT', '相同发布调用凭据不能对应不同内容');
         return clone(state.lessons.find(l => l.id === saved.lessonId));
       }
+      if (state.intent === 'logic-graph') {
+        const body = mermaid.replace(/^\s*(sequenceDiagram|flowchart\s+(?:TD|TB|BT|LR|RL)|classDiagram|stateDiagram-v2|erDiagram)\b/, '').replace(/;/g, '').split('\n').filter(line => !/^\s*%%/.test(line)).join('\n').trim();
+        if (!body) fail('GRAPH_REQUIRED', '本轮生成逻辑图必须提供安全、非空的 mermaid 图内容；请继续取证后重试，不能归档无图结果');
+      }
       if (state.revision !== args.expectedRevision) fail('STALE_REVISION', '阶段或主题已变化，请重新读取 reading_catalog');
       if (state.lessons.length >= 100) fail('LESSON_LIMIT', '此会话已有 100 个知识点，请新建阅读会话');
       if (turn !== undefined && state.lessons.some(l => l.turn === turn)) fail('ONE_TOPIC_PER_TURN', '每轮只保存一个知识点，等待用户后继续');
-      const refs = [...new Set([...args.claims.flatMap(c => c.evidenceIds), ...args.topics.flatMap(t => t.evidenceIds)])];
+      const refs = [...new Set([...args.claims.flatMap(c => c.evidenceIds), ...args.topics.flatMap(t => t.evidenceIds), ...codeUnits.flatMap(unit => unit.evidenceIds)])];
       if (refs.length > 40) fail('LESSON_EVIDENCE_LIMIT', '一个知识点最多引用 40 条证据，请拆成下一轮');
       for (const evidenceId of refs) { const status = await this.evidenceStatus(id, evidenceId); if (status.stale) fail('STALE_EVIDENCE', '代码已变动或无法读取，重新取证后再发布'); }
-      const lesson = { id: makeId('lesson'), ...args, ...(mermaid ? { mermaid } : {}), stage: state.stage, topic: state.topic, revision: state.revision, createdAt: new Date().toISOString(), ...(turn === undefined ? {} : { turn }) };
+      const verifiedUnits = await verifyCodeUnits(this, state, codeUnits, refs);
+      const lesson = { id: makeId('lesson'), ...args, codeUnits: verifiedUnits, readingFocus: clone(state.readingFocus ?? null), ...(mermaid ? { mermaid } : {}), stage: state.stage, topic: state.topic, readingMode: state.readingMode ?? 'question', intent: state.intent ?? 'explain', revision: state.revision, createdAt: new Date().toISOString(), ...(turn === undefined ? {} : { turn }) };
       if (!mermaid) delete lesson.mermaid;
       const positions = refs.map(evidenceId => state.evidence.find(e => e.id === evidenceId));
-      const note = `# ${lesson.title}\n\n阶段：${STAGE_LABELS[state.stage]} · 主题：${state.topic || '业务发现'}\n\n${lesson.markdown}\n\n## 核心结论\n\n${lesson.conclusion}\n\n## 证据与结论类型\n\n${lesson.claims.map(c => `- **${c.kind}**：${c.text}（${c.evidenceIds.join(', ') || '缺少证据'}）`).join('\n')}\n\n${positions.map(e => `- ${e.id} · ${e.repoId}:${e.path}:${e.startLine}–${e.endLine} · ${e.symbol || '无符号线索'} · SHA256 ${e.hash}`).join('\n')}\n${mermaid ? `\n\`\`\`mermaid\n${mermaid}\n\`\`\`\n` : ''}\n## 建议下一个问题\n\n${lesson.nextQuestions.map(q => `- ${q}`).join('\n')}\n`;
-      const dir = this.sessionDir(id); await this.writable(path.join(dir, 'notes')); await atomicText(path.join(dir, 'notes', `${lesson.id}.md`), note, 80000);
-      if (mermaid) { await this.writable(path.join(dir, 'diagrams')); await atomicText(path.join(dir, 'diagrams', `${lesson.id}.mmd`), `${mermaid}\n`, 20000); }
-      await this.audit(id, 'lesson-published', { lessonId: lesson.id, stage: state.stage, revision: state.revision, evidenceIds: refs });
-      state.lessons.push(lesson); if (receipt) state.publishReceipts[receipt] = { lessonId: lesson.id, payloadHash }; await this.saveState(state); return clone(lesson);
+      const note = `# ${lesson.title}\n\n兼容分类：${STAGE_LABELS[state.stage]} · 阅读入口：${lesson.readingMode} · 主题：${state.topic || '当前问题'}\n\n${lesson.markdown}${sectionMarkdown(lesson, 2)}${codeUnitsMarkdown(lesson)}\n\n## 核心结论\n\n${lesson.conclusion}\n\n## 证据与结论类型\n\n${lesson.claims.map(c => `- **${c.kind}**：${c.text}（${c.evidenceIds.join(', ') || '缺少证据'}）`).join('\n')}\n\n${positions.map(e => `- ${e.id} · ${e.repoId}:${e.path}:${e.startLine}–${e.endLine} · ${e.symbol || '无符号线索'} · SHA256 ${e.hash}`).join('\n')}\n${mermaid ? `\n\`\`\`mermaid\n${mermaid}\n\`\`\`\n` : ''}\n## 建议下一个问题\n\n${lesson.nextQuestions.map(q => `- ${q}`).join('\n')}\n`;
+      const dir = this.sessionDir(id); const graph = lesson.intent === 'logic-graph'; const written = [];
+      const expected = new Set([path.resolve(dir, 'notes', `${lesson.id}.md`), path.resolve(dir, 'diagrams', `${lesson.id}.mmd`)]);
+      const writeArtifact = async (file, text, max) => {
+        if (graph) {
+          // Never overwrite or later clean up a preexisting file, even on a UUID collision.
+          try { await fs.lstat(file); fail('OUTPUT_EXISTS', '逻辑图产物路径已存在，拒绝覆盖'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        }
+        await atomicText(file, text, max);
+        if (graph) written.push({ file: path.resolve(file), stat: await fs.lstat(file) });
+      };
+      try {
+        await this.writable(path.join(dir, 'notes')); await writeArtifact(path.join(dir, 'notes', `${lesson.id}.md`), note, 1048576);
+        if (mermaid) { await this.writable(path.join(dir, 'diagrams')); await writeArtifact(path.join(dir, 'diagrams', `${lesson.id}.mmd`), `${mermaid}\n`, 20000); }
+        await this.audit(id, graph ? 'lesson-publish-attempt' : 'lesson-published', { lessonId: lesson.id, stage: state.stage, revision: state.revision, evidenceIds: refs });
+        state.lessons.push(lesson); if (receipt) state.publishReceipts[receipt] = { lessonId: lesson.id, payloadHash }; await this.saveState(state); return clone(lesson);
+      } catch (error) {
+        const committed = this.session(id);
+        if (graph && !committed.lessons.some(item => item.id === lesson.id) && !Object.values(committed.publishReceipts).some(item => item.lessonId === lesson.id)) {
+          for (const owned of written) {
+            try {
+              // Exact paths are tied to this newly allocated lesson UUID, never a caller path.
+              if (!expected.has(owned.file) || !contains(dir, owned.file)) fail('OUTPUT_DENIED', '逻辑图清理路径不属于本次发布');
+              await checkBinding(this.storageBinding); await checkPlain(owned.file); const current = await fs.lstat(owned.file);
+              if (!current.isFile() || current.nlink !== 1 || current.dev !== owned.stat.dev || current.ino !== owned.stat.ino || current.size !== owned.stat.size || current.mtimeMs !== owned.stat.mtimeMs) fail('OUTPUT_CHANGED', '逻辑图产物已变化，保留文件以供检查');
+              await fs.unlink(owned.file);
+            } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') error.message += '；本次逻辑图未提交，产物清理受阻，请检查阅读档案目录'; }
+          }
+        }
+        throw error;
+      }
     });
   }
   async changeStage(raw) {
@@ -194,14 +287,15 @@ export class ReadingStore {
     }).catch(error => { this.archiveErrors.set(id, error.message); throw error; });
   }
   async snapshot(id, beforeSeq) {
-    const state = clone(this.session(id)); const selected = state.messageRefs.filter(m => beforeSeq === undefined || m.seq < beforeSeq).slice(-80); const messages = [];
+    const state = clone(this.session(id)); state.readerState = this.restoredReaderState(state); const selected = state.messageRefs.filter(m => beforeSeq === undefined || m.seq < beforeSeq).slice(-80); const messages = [];
     for (const item of selected) { const file = path.join(this.sessionDir(id), 'messages', `${item.seq}.json`); await checkPlain(file); messages.push(JSON.parse(await fs.readFile(file, 'utf8'))); }
     return { ...this.catalog(id), state, messages, hasMoreMessages: selected.length > 0 && state.messageRefs[0]?.seq < selected[0]?.seq, archiveError: this.archiveErrors.get(id) ?? null };
   }
   async exportSession(id) {
     return this.lock(id, async () => {
       const state = this.session(id); const project = this.project(state.projectId);
-      const text = `# ${project.title} — 阅读档案\n\n会话：${id}\n\n## 仓库绑定\n\n${project.repositories.map(r => `- ${r.name} (${r.id})：${r.root}`).join('\n')}\n\n## 阅读知识点\n\n${state.lessons.map(l => `### ${l.title}\n\n${l.markdown}\n\n**核心结论**：${l.conclusion}\n${l.mermaid ? `\n\`\`\`mermaid\n${l.mermaid}\n\`\`\`\n` : ''}`).join('\n\n')}\n\n## 证据索引\n\n${state.evidence.map(e => `- ${e.id} · ${e.repoId}:${e.path}:${e.startLine}–${e.endLine} · SHA256 ${e.hash}`).join('\n')}\n\n> 历史证据对应读取时的版本，不是当前源码承诺。阅读调用未运行项目；多个仓库不是原子快照。\n`;
+      let text = `# ${project.title} — 阅读档案\n\n会话：${id}\n\n## 仓库绑定\n\n${project.repositories.map(r => `- ${r.name} (${r.id})：${r.root}`).join('\n')}\n\n## 阅读知识点\n\n${state.lessons.map(l => `### ${l.title}\n\n${l.markdown}${sectionMarkdown(l, 4)}${codeUnitsMarkdown(l, 4)}\n\n**核心结论**：${l.conclusion}\n${l.mermaid ? `\n\`\`\`mermaid\n${l.mermaid}\n\`\`\`\n` : ''}`).join('\n\n')}\n\n## 证据索引\n\n${state.evidence.map(e => `- ${e.id} · ${e.repoId}:${e.path}:${e.startLine}–${e.endLine} · SHA256 ${e.hash}`).join('\n')}\n\n> 历史证据对应读取时的版本，不是当前源码承诺。阅读调用未运行项目；多个仓库不是原子快照。\n`;
+      text += annotationMarkdown((await loadAnnotations(this, id)).items);
       const dir = path.join(this.sessionDir(id), 'exports'); await this.writable(dir); const file = path.join(dir, 'reading.md'); await atomicText(file, text); await this.audit(id, 'exported'); return { path: file, markdown: text };
     });
   }
