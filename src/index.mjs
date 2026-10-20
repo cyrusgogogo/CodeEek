@@ -4,9 +4,11 @@ import { z } from 'zod';
 import { Config, resolveDataDirectory } from './config.mjs';
 import { PLUGIN_NAME, PLUGIN_VERSION, TARGET_DSH_VERSION, API_VERSION } from './version.mjs';
 import { ReadingStore, setRuntime, peekRuntime } from './store.mjs';
-import { PRESET, TOOL_NAMES, promptSchema, changeStageSchema, modelSchema, idSchema, requireObject, fail, effectiveModelSelection } from './contracts.mjs';
-import { checkBinding } from './filesystem.mjs';
+import { PRESET, TOOL_NAMES, promptSchema, changeStageSchema, modelSchema, selectionSchema, idSchema, requireObject, fail, effectiveModelSelection } from './contracts.mjs';
+import { checkBinding, readRepository } from './filesystem.mjs';
+import { canonicalSelection } from './anchors.mjs';
 import { browseDirectory, viewFile, listAnnotations, createAnnotation, updateAnnotation, selectionPrompt } from './workspace.mjs';
+import { readReadingSettings, setDefaultModel, modelRefSchema } from './preferences.mjs';
 
 export const name = 'code-reading';
 export const inject = ['agentPresets', 'tools', 'systemPrompt', 'connection', 'sessionController', 'skills', 'agents'];
@@ -15,6 +17,32 @@ export { Config };
 export function isReadingAgent(store, presets, agent) { return !!agent && (store.sessions.has(agent.id) || (!!agent.ctx && presets.composedPreset(agent.ctx) === PRESET)); }
 export function guardReadingCall(store, presets, execution) {
   if (isReadingAgent(store, presets, execution.agent) && !TOOL_NAMES.has(execution.name)) return '阅读代码模式只允许专用只读取证与归档工具；禁止 shell、通用写入、代理、网络及插件转调。';
+}
+
+export function installReadingModelRouting(ctx, runtime, current) {
+  const assembled = new WeakMap();
+  const selectionFor = agent => {
+    if (!agent || !runtime.store.sessions.has(agent.id)) return null;
+    const state = runtime.store.session(agent.id);
+    if (!state.modelSelectionManaged) return null;
+    const selected = effectiveModelSelection(agent.session.snapshotEvents(), state.pendingNativeModel ?? state.draftModelSelection ?? null);
+    if (!selected) fail('DEFAULT_MODEL_UNAVAILABLE', '此阅读会话的局部模型选择缺失，请在阅读设置中检查');
+    return { ...modelRefSchema.parse({ provider: selected.provider, model: selected.model }), ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }) };
+  };
+  const disposeAssembly = ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const agent = context.agent ?? context.scope; const selected = selectionFor(agent);
+    if (!selected) return next();
+    current(); const result = await next(); current(); assembled.set(agent, selected);
+    return { ...result, variables: { ...result.variables, provider: selected.provider, model: selected.model } };
+  }, { prepend: true });
+  const disposeRequest = ctx.on('agent/request', async ({ agent }, next) => {
+    if (!selectionFor(agent)) return next();
+    current(); const result = await next(); current(); const selected = assembled.get(agent);
+    if (!selected) fail('DEFAULT_MODEL_UNAVAILABLE', '阅读模型尚未完成原生提示组装，未发送模型请求');
+    const { reasoningEffort: _inheritedEffort, ...base } = result;
+    return { ...base, provider: selected.provider, model: selected.model, ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }) };
+  }, { prepend: true });
+  return () => { disposeAssembly?.(); disposeRequest?.(); };
 }
 
 export async function apply(ctx, rawConfig = {}) {
@@ -31,6 +59,7 @@ export async function apply(ctx, rawConfig = {}) {
   runtime.isReading = agent => isReadingAgent(store, runtime.context.agentPresets, agent);
   runtime.busy = id => runtime.context.agents.get(id)?.status === 'running';
   setRuntime(ctx.root, runtime);
+  ctx.effect(() => installReadingModelRouting(ctx, runtime, () => assertActive()), 'code-reading: session-local default model routing');
   ctx.effect(() => () => { if (runtime.activation === activation) runtime.enabled = false; }, 'code-reading: disable retained revisions');
   ctx.effect(() => ctx.tools.guard(exec => guardReadingCall(store, ctx.agentPresets, exec)), 'code-reading: execution guard');
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
@@ -62,7 +91,47 @@ export async function apply(ctx, rawConfig = {}) {
     if (!runtime.isReading(result.agent) || ctx.agentPresets.composedPreset(result.agent.ctx) !== PRESET) fail('NOT_READING_AGENT', '此会话的阅读 preset 已变化，请从阅读代码页面新建会话');
     return result.agent;
   }
+  async function availableReadingModel(selection, current) {
+    const selected = modelRefSchema.parse({ provider: selection?.provider, model: selection?.model });
+    current?.(); let catalog;
+    try { catalog = await ctx.sessionController.modelCatalog(); }
+    catch { current?.(); fail('DEFAULT_MODEL_UNAVAILABLE', '无法核验默认阅读模型目录；请重新加载设置，不会改用其它模型'); }
+    current?.();
+    if (!catalog?.groups?.some(group => group.id === selected.provider && group.models?.some(model => model.id === selected.model))) fail('DEFAULT_MODEL_UNAVAILABLE', '默认阅读模型当前不可用，请在阅读设置中更改或清除；不会自动改用DSH默认');
+    return selected;
+  }
+  async function selectLocalReadingModel(agent, selection, current) {
+    const selected = await availableReadingModel(selection, current); current?.();
+    const latest = effectiveModelSelection(agent.session.snapshotEvents());
+    if (!latest || latest.provider !== selected.provider || latest.model !== selected.model || latest.reasoningEffort !== undefined) agent.session.append('model/selection', selected);
+    await store.archiveEvents(agent.id, agent.session.snapshotEvents()); current?.();
+    return { selected };
+  }
+  async function ensurePendingNativeSession(id, current) {
+    const state = store.session(id);
+    if (!state.nativePending) return ensureSession(id);
+    current();
+    if (state.modelSelectionManaged) await availableReadingModel(state.pendingNativeModel, current);
+    const existing = await ctx.sessionController.resolveAgent(id); current();
+    if (!existing.agent) {
+      await ctx.sessionController.create({ sessionId: id, cwd: store.sessionDir(id), agentPreset: PRESET }); current();
+      await ctx.sessionController.rename({ sessionId: id, title: state.topic.trim().slice(0, 120) || '未命名阅读主题' }); current();
+    }
+    const agent = await ensureSession(id); current();
+    const selection = store.session(id).pendingNativeModel;
+    if (selection) {
+      if (store.session(id).modelSelectionManaged) await selectLocalReadingModel(agent, selection, current);
+      else await ctx.sessionController.selectModel({ sessionId: id, provider: selection.provider, model: selection.model });
+      current();
+    }
+    await store.completeNativeSession(id, current); current(); return agent;
+  }
+  async function ensurePromptSession(id, epoch, signal) {
+    const current = () => { assertPromptCurrent(id, epoch, signal); store.assertUnarchived(id); if (runtime.busy(id)) fail('AGENT_BUSY', '本轮阅读还在进行，请等待或停止后再发送'); };
+    return ensurePendingNativeSession(id, current);
+  }
   async function archive(id) {
+    store.assertPersisted(id);
     const inspection = await ctx.sessionController.inspect(id);
     await store.archiveEvents(id, inspection.events);
     return inspection;
@@ -73,46 +142,82 @@ export async function apply(ctx, rawConfig = {}) {
     if (!runtime.enabled || runtime.activation !== activation) fail('READING_UNAVAILABLE', '阅读 Host 已停用或更新。请检查插件状态，重启或刷新后再操作');
   }
   function assertPromptCurrent(id, epoch, signal) {
-    assertActive(signal);
+    assertActive(signal); store.assertUnarchived(id);
     if (epoch !== (runtime.cancelEpochs.get(id) ?? 0)) fail('PROMPT_CANCELLED', '此提问已在入队前取消，未发送给模型');
   }
   async function dispatch(method, params, signal, admitted = false, promptEpoch) {
     assertActive(signal);
-    if (method === 'prompt') {
+    if (['prompt', 'annotation-create', 'discard-draft'].includes(method)) {
       const id = idSchema.parse(params.sessionId);
+      if (!admitted && method === 'discard-draft') runtime.cancelEpochs.set(id, (runtime.cancelEpochs.get(id) ?? 0) + 1);
       promptEpoch ??= runtime.cancelEpochs.get(id) ?? 0;
-      if (promptEpoch !== (runtime.cancelEpochs.get(id) ?? 0)) fail('PROMPT_CANCELLED', '此提问已在入队前取消，未发送给模型');
+      if (promptEpoch !== (runtime.cancelEpochs.get(id) ?? 0)) fail(method === 'prompt' ? 'PROMPT_CANCELLED' : 'OPERATION_CANCELLED', '此操作已取消，未提交后续修改');
     }
-    if (!admitted && ['prompt', 'stage', 'select-model', 'annotation-create', 'annotation-update', 'reader-state'].includes(method)) {
+    if (!admitted && ['prompt', 'stage', 'select-model', 'annotation-create', 'annotation-update', 'reader-state', 'discard-draft', 'set-session-archived'].includes(method)) {
       const id = idSchema.parse(params.sessionId);
-      await ensureSession(id);
+      if (method !== 'discard-draft') {
+        const state = store.session(id);
+        if (['prompt', 'stage', 'select-model'].includes(method)) store.assertUnarchived(id);
+        if (method === 'annotation-update') store.assertPersisted(id);
+        if (!state.draft && !state.nativePending && method !== 'set-session-archived') await ensureSession(id);
+      }
       return store.lock(`admission:${id}`, () => dispatch(method, params, signal, true, promptEpoch));
     }
     switch (method) {
       case 'status': {
         requireObject(params, []);
-        return { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: store.root, dataSource, tools: [...TOOL_NAMES] };
+        return { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, capabilities: ['remove-project', 'default-model'], dataDirectory: store.root, dataSource, tools: [...TOOL_NAMES] };
       }
+      case 'reading-settings': requireObject(params, []); return readReadingSettings(store, () => assertActive(signal));
+      case 'set-default-model': return setDefaultModel(store, params, () => assertActive(signal), selected => availableReadingModel(selected, () => assertActive(signal)));
       case 'list': requireObject(params, []); return store.list();
       case 'create-project': return store.createProject(params);
+      case 'remove-project': return store.removeProject(params, () => assertActive(signal), id => runtime.busy(id));
       case 'create-session': {
-        const { projectId } = z.object({ projectId: idSchema }).strict().parse(params);
-        const state = await store.createSession(projectId);
-        await ctx.sessionController.create({ sessionId: state.id, cwd: store.sessionDir(state.id), agentPreset: PRESET });
-        await ctx.sessionController.rename({ sessionId: state.id, title: '未命名阅读主题' });
+        const { projectId, draft } = z.object({ projectId: idSchema, draft: z.boolean().default(false) }).strict().parse(params);
+        const current = () => assertActive(signal);
+        const settings = await readReadingSettings(store, current); current();
+        const selected = settings.defaultModel ? await availableReadingModel(settings.defaultModel, current) : null;
+        const state = await store.createSession(projectId, { draft, modelSelection: selected ?? ctx.get('agentDefaultModel')?.currentSelection() ?? null, modelSelectionManaged: !!selected }, current);
+        if (!draft) {
+          if (selected) await ensurePendingNativeSession(state.id, () => { current(); store.assertUnarchived(state.id); if (runtime.busy(state.id)) fail('AGENT_BUSY', '阅读进行中不能初始化模型'); });
+          else {
+            current(); await ctx.sessionController.create({ sessionId: state.id, cwd: store.sessionDir(state.id), agentPreset: PRESET });
+            current(); await ctx.sessionController.rename({ sessionId: state.id, title: '未命名阅读主题' });
+          }
+        }
         return { sessionId: state.id };
       }
       case 'snapshot': {
         const args = z.object({ sessionId: idSchema, beforeSeq: z.number().int().min(0).optional() }).strict().parse(params);
+        const state = store.session(args.sessionId);
+        if (state.draft || (state.nativePending && !ctx.agents.get(args.sessionId))) return { ...await store.snapshot(args.sessionId, args.beforeSeq), running: false, turnEnd: null, modelSelection: structuredClone((state.draft ? state.draftModelSelection : state.pendingNativeModel) ?? null) };
         let inspection;
         try { inspection = await ctx.sessionController.inspect(args.sessionId); await store.archiveEvents(args.sessionId, inspection.events); } catch (error) { store.archiveErrors.set(args.sessionId, error.message); }
         const events = [...(inspection?.events ?? [])].reverse();
         const end = events.find(event => event.type === 'turn/end');
-        const selection = inspection ? effectiveModelSelection(inspection.events, ctx.get('agentDefaultModel')?.currentSelection() ?? null) : null;
+        const selection = state.modelSelectionManaged && state.nativePending ? state.pendingNativeModel : inspection ? effectiveModelSelection(inspection.events, ctx.get('agentDefaultModel')?.currentSelection() ?? null) : null;
         return { ...await store.snapshot(args.sessionId, args.beforeSeq), running: runtime.busy(args.sessionId), turnEnd: end ? { seq: end.seq, reason: end.data.reason } : null, modelSelection: selection ?? null };
       }
       case 'prompt': {
-        const args = promptSchema.parse(params); const agent = await ensureSession(args.sessionId);
+        const args = promptSchema.parse(params); store.assertUnarchived(args.sessionId); let preparedText;
+        if (store.session(args.sessionId).draft || store.session(args.sessionId).nativePending) {
+          const current = () => {
+            assertPromptCurrent(args.sessionId, promptEpoch, signal); const state = store.assertUnarchived(args.sessionId);
+            if (state.revision !== args.expectedRevision) fail('STALE_REVISION', '阅读阶段已变化，请刷新后重新发送');
+            if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '本轮阅读还在进行，请等待或停止后再发送');
+            const selected = state.draft ? state.draftModelSelection : state.pendingNativeModel;
+            if (!selected || selected.provider !== args.expectedModel.provider || selected.model !== args.expectedModel.model) fail('MODEL_CHANGED', '本会话实际模型已变化，请刷新确认提供方后重发');
+          };
+          current();
+          if (store.session(args.sessionId).modelSelectionManaged) {
+            const selected = store.session(args.sessionId);
+            await availableReadingModel(selected.draft ? selected.draftModelSelection : selected.pendingNativeModel, current);
+          }
+          preparedText = args.text + (args.selection ? await selectionPrompt(store, args.sessionId, args.selection, signal, args.intent) : '');
+          current(); await store.persistDraft(args.sessionId, current); current();
+        }
+        const agent = await ensurePromptSession(args.sessionId, promptEpoch, signal);
         const inspection = await ctx.sessionController.inspect(args.sessionId);
         assertPromptCurrent(args.sessionId, promptEpoch, signal);
         const alreadyAccepted = inspection.events.some(event => event.type === 'user/message' && event.data.source?.kind === 'user' && event.data.source.rpcId === args.requestId) || [...(agent.inbox?.nextTurn ?? []), ...(agent.inbox?.nextStep ?? [])].some(message => message.source?.kind === 'user' && message.source.rpcId === args.requestId);
@@ -121,7 +226,15 @@ export async function apply(ctx, rawConfig = {}) {
         if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '本轮阅读还在进行，请等待或停止后再发送');
         const admittedModel = effectiveModelSelection(inspection.events, ctx.get('agentDefaultModel')?.currentSelection() ?? null);
         if (!admittedModel || admittedModel.provider !== args.expectedModel.provider || admittedModel.model !== args.expectedModel.model) fail('MODEL_CHANGED', '本会话实际模型已变化，请刷新确认提供方后重发');
-        const text = args.text + (args.selection ? await selectionPrompt(store, args.sessionId, args.selection, signal, args.intent) : '');
+        if (store.session(args.sessionId).modelSelectionManaged) {
+          const current = () => {
+            assertPromptCurrent(args.sessionId, promptEpoch, signal);
+            if (store.session(args.sessionId).revision !== args.expectedRevision) fail('STALE_REVISION', '阅读阶段已变化，请刷新后重新发送');
+            if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '本轮阅读还在进行');
+          };
+          await availableReadingModel(admittedModel, current);
+        }
+        const text = preparedText ?? (args.text + (args.selection ? await selectionPrompt(store, args.sessionId, args.selection, signal, args.intent) : ''));
         // selectionPrompt has verified these coordinates against the actual file; never persist its quote here.
         const focus = args.selection ? { repoId: args.selection.repoId, path: args.selection.path, fileHash: args.selection.fileHash, start: { ...args.selection.start }, end: { ...args.selection.end } } : null;
         // Catalog/system-prompt assembly can begin synchronously in native prompt().
@@ -142,19 +255,19 @@ export async function apply(ctx, rawConfig = {}) {
       }
       case 'stage': {
         const args = changeStageSchema.parse(params);
-        await ensureSession(args.sessionId); assertActive(signal);
-        if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能改变阶段或主题；请先停止');
-        const state = store.session(args.sessionId);
+        const state = store.assertUnarchived(args.sessionId); const native = !state.draft && !state.nativePending;
+        if (native) await ensureSession(args.sessionId);
+        const current = () => { assertActive(signal); store.assertUnarchived(args.sessionId); if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能改变阶段或主题；请先停止'); };
+        current();
         const firstTopic = !!args.topic.trim() && !state.stageHistory.some(item => item.topic?.trim());
         const defaults = new Set(['未命名阅读主题', `阅读 · ${store.project(state.projectId).title}`]);
         let previousTitle;
-        if (firstTopic) {
+        if (firstTopic && native) {
           try { previousTitle = (await ctx.sessionController.inspect(args.sessionId)).meta?.title; }
           catch { /* Unknown title: keep the native session name rather than overwrite user history. */ }
         }
-        assertActive(signal);
-        if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能改变阶段或主题；请先停止');
-        const result = await store.changeStage(args);
+        current();
+        const result = await store.changeStage(args, current);
         if (firstTopic && defaults.has(previousTitle)) {
           try {
             const currentTitle = (await ctx.sessionController.inspect(args.sessionId)).meta?.title;
@@ -167,9 +280,17 @@ export async function apply(ctx, rawConfig = {}) {
       case 'reader-state': return store.updateReaderState(params, () => assertActive(signal));
       case 'tree': return browseDirectory(store, params, signal);
       case 'view-file': return viewFile(store, params, signal, () => assertActive(signal));
-      case 'annotations': return listAnnotations(store, params);
-      case 'annotation-create': return createAnnotation(store, params, signal, () => assertActive(signal));
-      case 'annotation-update': return updateAnnotation(store, params, signal, () => assertActive(signal));
+      case 'annotations': { const id = onlyId(params); return store.session(id).draft ? { revision: 0, items: [] } : listAnnotations(store, params); }
+      case 'annotation-create': {
+        const args = z.object({ sessionId: idSchema, requestId: z.string().uuid(), body: z.string().trim().min(1).max(4000), selection: selectionSchema }).strict().parse(params);
+        const current = () => { assertActive(signal); if (promptEpoch !== (runtime.cancelEpochs.get(args.sessionId) ?? 0)) fail('OPERATION_CANCELLED', '此次批注保存已取消，未提交后续修改'); };
+        if (store.session(args.sessionId).draft) {
+          const source = await readRepository(store.repo(args.sessionId, args.selection.repoId), args.selection.path); canonicalSelection(source, args.selection);
+          current(); await store.persistDraft(args.sessionId, current);
+        }
+        current(); return createAnnotation(store, args, signal, current);
+      }
+      case 'annotation-update': store.assertPersisted(idSchema.parse(params.sessionId)); return updateAnnotation(store, params, signal, () => assertActive(signal));
       case 'read': {
         const { sessionId, ...args } = requireObject(params, ['sessionId', 'repoId', 'path', 'offset', 'limit', 'symbol']); store.session(sessionId); return store.read(sessionId, args, signal);
       }
@@ -182,16 +303,30 @@ export async function apply(ctx, rawConfig = {}) {
       case 'evidence': {
         const args = z.object({ sessionId: idSchema, evidenceId: idSchema }).strict().parse(params); return store.openEvidence(args.sessionId, args.evidenceId);
       }
-      case 'export': { const id = onlyId(params); await archive(id); return store.exportSession(id); }
+      case 'export': { const id = onlyId(params); const state = store.assertPersisted(id); if (!state.nativePending || ctx.agents.get(id)) await archive(id); return store.exportSession(id); }
       case 'models': requireObject(params, []); return ctx.sessionController.modelCatalog();
       case 'select-model': {
-        const args = modelSchema.parse(params); await ensureSession(args.sessionId); assertActive(signal);
-        if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能切换模型');
-        return ctx.sessionController.selectModel(args);
+        const args = modelSchema.parse(params); const state = store.assertUnarchived(args.sessionId);
+        const current = () => { assertActive(signal); store.assertUnarchived(args.sessionId); if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '阅读进行中不能切换模型'); };
+        if (state.modelSelectionManaged) {
+          const selected = { provider: args.provider, model: args.model };
+          if (state.draft || state.nativePending) { await availableReadingModel(selected, current); return store.selectDraftModel(args, current); }
+          const agent = await ensureSession(args.sessionId); current(); return selectLocalReadingModel(agent, selected, current);
+        }
+        if (state.draft || state.nativePending) return store.selectDraftModel(args, current);
+        await ensureSession(args.sessionId); current(); return ctx.sessionController.selectModel(args);
+      }
+      case 'discard-draft': {
+        const id = onlyId(params); const result = await store.discardDraft(id, () => assertActive(signal)); runtime.cancelEpochs.delete(id); return result;
+      }
+      case 'set-session-archived': {
+        const id = idSchema.parse(params.sessionId);
+        return store.setSessionArchived(params, () => { assertActive(signal); if (runtime.busy(id)) fail('AGENT_BUSY', '阅读进行中不能归档或恢复会话，请先停止'); });
       }
       case 'cancel': {
-        const id = onlyId(params); store.session(id);
+        const id = onlyId(params); const state = store.session(id);
         runtime.cancelEpochs.set(id, (runtime.cancelEpochs.get(id) ?? 0) + 1);
+        if (state.draft || (state.nativePending && !ctx.agents.get(id))) return { cancelled: true, running: false };
         return ctx.sessionController.cancel({ sessionId: id });
       }
       default: fail('UNKNOWN_METHOD', '不支持此阅读页面操作');

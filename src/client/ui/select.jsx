@@ -15,8 +15,8 @@ export const SelectTrigger = React.forwardRef(function SelectTrigger({ className
   </SelectPrimitive.Trigger>;
 });
 
-export const SelectContent = React.forwardRef(function SelectContent({ className = '', children, ...props }, ref) {
-  return <SelectPrimitive.Portal><SelectPrimitive.Content ref={ref} className={`cr-select-content ${className}`} position="popper" align="start" sideOffset={6} collisionPadding={12} {...props}>
+export const SelectContent = React.forwardRef(function SelectContent({ className = '', children, portalContainer, ...props }, ref) {
+  return <SelectPrimitive.Portal container={portalContainer}><SelectPrimitive.Content ref={ref} className={`cr-select-content ${className}`} position="popper" align="start" sideOffset={6} collisionPadding={12} {...props}>
     <SelectPrimitive.ScrollUpButton className="cr-select-scroll"><UiIcon name="chevron-up" /></SelectPrimitive.ScrollUpButton>
     <SelectPrimitive.Viewport className="cr-select-viewport">{children}</SelectPrimitive.Viewport>
     <SelectPrimitive.ScrollDownButton className="cr-select-scroll"><UiIcon name="chevron-down" /></SelectPrimitive.ScrollDownButton>

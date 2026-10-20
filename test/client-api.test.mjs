@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { api, validateHostStatus } from '../src/client/api.mjs';
+import { api, validateHostStatus, validateReadingSettings } from '../src/client/api.mjs';
 import { PLUGIN_NAME, PLUGIN_VERSION, TARGET_DSH_VERSION, API_VERSION } from '../src/version.mjs';
 
 function transport(t, fetch) {
@@ -57,12 +57,47 @@ test('非 JSON 服务器故障与标准停用错误均能识别', async t => {
   globalThis.__DSH_TRANSPORT__.fetch = async () => Response.json({ ok: false, error: { code: 'READING_UNAVAILABLE', message: 'Host 已停用' } }, { status: 503 });
   await assert.rejects(api('list'), { code: 'READING_UNAVAILABLE', status: 503 });
 });
+test('默认模型响应只接受明确的空值或有界无歧义模型引用', () => {
+  assert.deepEqual(validateReadingSettings({ revision: 0, defaultModel: null }), { revision: 0, defaultModel: null });
+  const value = { revision: 2, defaultModel: { provider: 'local', model: 'reader' } };
+  assert.deepEqual(validateReadingSettings(value), value); assert.notEqual(validateReadingSettings(value).defaultModel, value.defaultModel);
+  for (const wrong of [null, {}, { revision: 0 }, { revision: -1, defaultModel: null }, { revision: 1.5, defaultModel: null }, { revision: Number.MAX_SAFE_INTEGER + 1, defaultModel: null }, ...[[], {}, { provider: 'a\u0000b', model: 'reader' }, { provider: ' local', model: 'reader' }, { provider: 'local', model: '' }, { provider: 'p'.repeat(101), model: 'reader' }, { provider: 'local', model: 'm'.repeat(201) }].map(defaultModel => ({ revision: 1, defaultModel }))]) assert.throws(() => validateReadingSettings(wrong), { code: 'PROTOCOL_ERROR' });
+});
+
 test('旧 Host 不支持状态方法时明确提示完整重启', async t => {
   transport(t, async () => Response.json({ ok: false, error: { code: 'UNKNOWN_METHOD', message: '不支持' } }, { status: 400 }));
   await assert.rejects(api('status'), error => error.code === 'VERSION_MISMATCH' && /完整退出/.test(error.message));
 });
 test('就绪判断要求包版本、接口、目标和启用状态全部一致', () => {
-  const healthy = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root' };
+  const healthy = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root', capabilities: ['remove-project', 'default-model'] };
   assert.equal(validateHostStatus(healthy), healthy);
   for (const wrong of [null, { ...healthy, version: '0.1.1' }, { ...healthy, apiVersion: 999 }, { ...healthy, enabled: false }, { ...healthy, targetDshVersion: 'unknown' }]) assert.throws(() => validateHostStatus(wrong), { code: 'VERSION_MISMATCH' });
+});
+test('同版本旧 Host 没有仓库移除能力也不能通过就绪检查', () => {
+  const old = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root' };
+  for (const capabilities of [undefined, null, [], 'remove-project', ['other-feature']]) assert.throws(() => validateHostStatus({ ...old, capabilities }), error => error.code === 'VERSION_MISMATCH' && /仓库移除/.test(error.message) && /完整退出/.test(error.message));
+  assert.doesNotThrow(() => validateHostStatus({ ...old, capabilities: ['remove-project', 'default-model', 'future-feature'] }));
+});
+test('同版本旧 Host 缺少默认模型能力不能开放新页面操作', () => {
+  const old = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root', capabilities: ['remove-project'] };
+  assert.throws(() => validateHostStatus(old), error => error.code === 'VERSION_MISMATCH' && /默认阅读模型/.test(error.message) && /完整退出/.test(error.message));
+});
+test('旧 Host 不支持默认模型设置时明确指出未保存，且不自动重发', async t => {
+  let calls = 0; transport(t, async () => { calls++; return Response.json({ ok: false, error: { code: 'UNKNOWN_METHOD', message: '不支持此阅读页面操作' } }, { status: 400 }); });
+  await assert.rejects(api('reading-settings'), error => error.code === 'VERSION_MISMATCH' && /默认阅读模型/.test(error.message));
+  await assert.rejects(api('set-default-model', { expectedRevision: 0, defaultModel: null }), error => error.code === 'VERSION_MISMATCH' && /本次设置未保存/.test(error.message)); assert.equal(calls, 2);
+});
+test('删除返回截图 UNKNOWN_METHOD 时说明 Host 未更新，单次请求且不声称删除成功', async t => {
+  const calls = []; transport(t, async (_url, init) => { calls.push(JSON.parse(init.body)); return Response.json({ ok: false, error: { code: 'UNKNOWN_METHOD', message: '不支持此阅读页面操作' } }, { status: 400 }); });
+  const params = { projectId: 'project-fixture', expectedBindingRevision: 1 };
+  await assert.rejects(api('remove-project', params), error => error.code === 'VERSION_MISMATCH' && /本次删除未执行/.test(error.message) && /完整退出/.test(error.message) && /安装/.test(error.message));
+  assert.deepEqual(calls, [{ method: 'remove-project', params }]);
+});
+test('删除的业务失败和未知方法保留原错误；网络失败仍提示结果未确认', async t => {
+  transport(t, async () => Response.json({ ok: false, error: { code: 'AGENT_BUSY', message: '阅读进行中' } }, { status: 400 }));
+  await assert.rejects(api('remove-project'), { code: 'AGENT_BUSY', status: 400 });
+  globalThis.__DSH_TRANSPORT__.fetch = async () => Response.json({ ok: false, error: { code: 'UNKNOWN_METHOD', message: '不支持此阅读页面操作' } }, { status: 400 });
+  await assert.rejects(api('not-a-real-method'), { code: 'UNKNOWN_METHOD' });
+  let calls = 0; globalThis.__DSH_TRANSPORT__.fetch = async () => { calls++; throw new TypeError('offline'); };
+  await assert.rejects(api('remove-project'), error => error.code === 'NETWORK_ERROR' && /未能确认/.test(error.message) && !/本次删除未执行/.test(error.message)); assert.equal(calls, 1);
 });

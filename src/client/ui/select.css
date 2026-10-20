@@ -1,5 +1,5 @@
 /* shadcn Select visuals, scoped to the plugin without a global Tailwind reset.
-   Portal content owns the same theme tokens because it is mounted under body. */
+   Portal content owns theme tokens for body mounting; native-dialog portals use the same DSH tokens. */
 .cr-select-content {
   --cr-bg:var(--dsw-alias-bg-base,#fff);
   --cr-border:var(--dsw-alias-border-l1,#dce3ee);

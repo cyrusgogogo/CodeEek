@@ -71,7 +71,7 @@ test('Host 与 scoped preset 接线：只读模式、五个专用工具和私有
 test('安装状态只读返回同源版本与目录来源，不创建项目或请求模型', async t => {
   const f = await nativeFixture(t); const before = f.runtime.store.list(); const status = await f.runtime.dispatch('status', {});
   assert.equal(status.package, 'dsh-code-reading'); assert.equal(status.version, JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
-  assert.equal(status.apiVersion, 1); assert.equal(status.targetDshVersion, '0.2.1-rc.2'); assert.equal(status.dataDirectory, path.resolve(f.dataDir)); assert.equal(status.dataSource, 'config.dataDir');
+  assert.equal(status.apiVersion, 1); assert.deepEqual(status.capabilities, ['remove-project', 'default-model']); assert.equal(status.targetDshVersion, '0.2.1-rc.2'); assert.equal(status.dataDirectory, path.resolve(f.dataDir)); assert.equal(status.dataSource, 'config.dataDir');
   assert.deepEqual(f.runtime.store.list(), before); assert.equal(f.ctx.calls.length, 0);
 });
 test('不支持的请求类型也返回统一错误 envelope', async t => {
@@ -394,4 +394,23 @@ test('模式审计或原子保存失败时不调用原生 prompt，后续明确�
   f.runtime.store.saveState = async () => { throw new Error('mode commit unavailable'); };
   await assert.rejects(f.runtime.dispatch('prompt', args), /mode commit unavailable/); assert.equal(f.ctx.calls.length, 0); assert.equal(f.runtime.store.session(f.sessionId).readingMode, 'question');
   f.runtime.store.saveState = save; await f.runtime.dispatch('prompt', args); assert.equal(f.ctx.calls.length, 1); assert.equal(f.runtime.store.session(f.sessionId).readingMode, 'code');
+});
+
+test('仓库移除端点只逻辑移除，旧页面与保留工具不能继续取证，也不删除 native 会话', async t => {
+  const f = await nativeFixture(t); applyPreset(f.ctx); const file = path.join(f.runtime.store.sessionDir(f.sessionId), 'state.json'); const before = await fs.readFile(file); const source = await fs.readFile(path.join(f.repo, 'entry.ts')); const agent = f.ctx.live.get(f.sessionId);
+  const response = await f.ctx.route.fetch(new Request('http://localhost/api/code-reading', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ method: 'remove-project', params: { projectId: f.project.id, expectedBindingRevision: 1 } }) }));
+  assert.equal(response.status, 200); const envelope = await response.json(); assert.equal(envelope.ok, true); const result = envelope.value; assert.equal(result.projectId, f.project.id); assert.deepEqual((await f.runtime.dispatch('list', {})).projects, []);
+  for (const [method, params] of [['snapshot', { sessionId: f.sessionId }], ['view-file', { sessionId: f.sessionId, repoId: f.project.repositories[0].id, path: 'entry.ts' }], ['prompt', promptRequest(f)]]) await assert.rejects(f.runtime.dispatch(method, params), { code: 'PROJECT_REMOVED' });
+  await assert.rejects(f.ctx.definitions.get('reading_catalog').execute({}, { agent }), { code: 'PROJECT_REMOVED' }); assert.ok(f.ctx.guards.some(check => check({ agent, name: 'write' })));
+  assert.equal(f.ctx.live.get(f.sessionId), agent); assert.equal(f.ctx.calls.length, 0); assert.deepEqual(await fs.readFile(file), before); assert.deepEqual(await fs.readFile(path.join(f.repo, 'entry.ts')), source);
+});
+
+test('任一同项目会话运行中拒绝移除，prompt异步准入与移除串行不死锁', async t => {
+  const f = await nativeFixture(t); const other = await f.runtime.dispatch('create-session', { projectId: f.project.id }); const params = { projectId: f.project.id, expectedBindingRevision: 1 };
+  f.ctx.live.get(other.sessionId).status = 'running'; await assert.rejects(f.runtime.dispatch('remove-project', params), { code: 'AGENT_BUSY' }); f.ctx.live.get(other.sessionId).status = 'idle';
+  const entered = deferred(); const release = deferred(); const inspect = f.ctx.sessionController.inspect;
+  f.ctx.sessionController.inspect = async id => { entered.resolve(); await release.promise; return inspect(id); };
+  const admitted = f.runtime.dispatch('prompt', promptRequest(f)); await entered.promise;
+  const removal = f.runtime.dispatch('remove-project', params); const refused = assert.rejects(removal, { code: 'AGENT_BUSY' }); release.resolve(); await admitted; await refused;
+  assert.equal(f.ctx.calls.length, 1); assert.equal((await f.runtime.dispatch('list', {})).projects.length, 1);
 });

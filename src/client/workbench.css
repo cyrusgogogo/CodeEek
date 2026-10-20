@@ -158,6 +158,30 @@
 .cr-dialog-body li small { display:block; color:var(--cr-muted); }
 .cr-dialog-body summary { cursor:pointer; }
 .cr-dialog .cr-help { margin:0; padding:0; border:0; background:transparent; }
+.cr-page .cr-consent-dialog,.cr-page .cr-settings-dialog { width:min(600px,calc(100vw - 32px)); }
+.cr-consent-summary { margin:4px 0 16px; }
+.cr-consent-summary > div { padding:12px 0; border-bottom:1px solid var(--cr-border); }
+.cr-consent-summary dt { margin-bottom:6px; color:var(--cr-muted); font-size:12px; }
+.cr-consent-summary dd { margin:0; font-size:15px; line-height:1.7; overflow-wrap:anywhere; }
+.cr-consent-summary dd strong { font-weight:650; }
+.cr-consent-summary dd > small { display:block; margin-top:4px; color:var(--cr-muted); }
+.cr-consent-range { font-family:'Cascadia Code',Consolas,monospace; font-size:13px; }
+.cr-consent-note { font-size:12px; line-height:1.8; }
+.cr-consent-details { margin:14px 0 20px; font-size:12px; }
+.cr-consent-details summary { min-height:36px; display:flex; align-items:center; color:var(--cr-muted); }
+.cr-consent-details summary::before { content:'▸'; margin-right:7px; }
+.cr-consent-details[open] summary::before { content:'▾'; }
+.cr-consent-details ul { padding-left:20px; margin:6px 0; }
+.cr-reading-settings section + section { margin-top:22px; padding-top:2px; border-top:1px solid var(--cr-border); }
+.cr-reading-settings section > h3 { margin-top:12px; margin-bottom:8px; }
+.cr-page .cr-reading-settings .cr-select-trigger { width:100%; min-width:0; }
+.cr-reading-settings .cr-settings-actions { margin-top:14px; }
+.cr-reading-settings .cr-archive-path { margin:8px 0 0; padding:10px 12px; border:1px solid var(--cr-border); border-radius:7px; background:var(--cr-raised); user-select:text; }
+.cr-reading-settings [role=status] { color:var(--cr-success); font-size:12px; }
+.cr-reading-settings .cr-error { overflow-wrap:anywhere; }
+.cr-dialog .cr-help h2 { display:none; }
+.cr-dialog .cr-help .cr-checklist { margin:16px 0; }
+.cr-dialog .cr-help details { font-size:12px; }
 .cr-workbench .cr-banner { font-size:12px; }
 .cr-banner > button { padding:3px 8px; margin-left:8px; font-size:11px; }
 /* Directory/notes replace the real source on demand, rather than creating a fourth rail. */
@@ -188,10 +212,6 @@
 .cr-source-rail .cr-file-identity h3 { font-size:13px; }
 .cr-source-rail .cr-file-heading-actions { gap:6px; }
 .cr-source-rail .cr-file-heading button { font-size:10px; }
-.cr-source-rail .cr-file-navigation { padding:8px; gap:6px; }
-.cr-source-rail .cr-file-navigation button { font-size:10px; }
-.cr-source-rail .cr-file-navigation label { margin-left:0; }
-.cr-source-rail .cr-file-navigation input { width:62px; }
 .cr-source-rail .cr-file-empty { min-height:160px; margin:20px 0; padding:22px 10px; border:0; background:transparent; }
 .cr-source-rail .cr-file-empty h3 { font-size:15px; }
 .cr-source-rail .cr-file-empty > p { font-size:12px; }

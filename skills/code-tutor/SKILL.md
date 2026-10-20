@@ -55,13 +55,27 @@ Host 检查当前字节 SHA256、UTF16 行列和连续证据覆盖；**完整语
 
 ## 3. 归档并结束
 
+### 工具参数 JSON
+
+每次工具调用发送**单个合法 JSON 对象**。先按 JSON 规则序列化全部字符串，再提交；尤其检查 `claims[].text`、`markdown`、`sections[].markdown` 和 `codeUnits[].conclusion`：内容中的英文双引号写成 `\"`，反斜杠写成 `\\`，换行写成 `\n`。自然语言引用术语可使用中文引号“…”；真实代码、路径、选文和证据保持原义，按规则转义。
+
+以下仅演示字符串转义，不是完整归档参数；实际调用仍须填写全部必填字段和真实证据：
+
+```json
+{"text":"比较 \"cache\" 状态；路径 C:\\src\\file\n下一行"}
+```
+
+工具参数本身直接发送对象，不带代码围栏、解释前后缀或多个并列 JSON。正文保持完整但精炼；claims 和单元结论只写对应短结论，不重复整篇正文。提交前检查引号、转义、逗号与括号配对，再进行下方归档。序列化约束不能替代证据、源码版本或范围核验，也只能降低格式错误风险，不能保证真实模型不再产生非法 JSON。
+
+### 归档字段
+
 调用 reading_publish 保存一个知识点，expectedRevision 使用本轮 reading_catalog 的 revision：
 
 - 必填 title、markdown、conclusion、claims、nextQuestions。**markdown 是完整正文与回退/导出来源**，即使提供 sections 也须能独立阅读。结论和证据链接保留在正文中。
 - 代码来源须提供 codeUnits，最多 12 项，每项为 `{ kind, name, repoId, path, fileHash, start, end, conclusion, evidenceIds }`。kind 仅 function/method/constructor/class/file，名称不超过 200 字符，单元结论不超过 2,000 字符；start/end 是实际源码的 1-based 行、0-based UTF16 列，end 排他。每项引用最多 40 个本会话、同仓库/路径/原始 SHA256 的证据，连续覆盖整个完整单元；全知识点去重证据仍最多 40 个。可归档多个完整单元及各自结论，不能只给无范围的总结。代码 readingFocus 即使未列入 claims 也须被同版本单元包含。明确文档/数据文件可省略，不为旧档案猜造方法范围。
-- sections 在 schema 中可省略/default [] 仅为兼容旧请求与档案；**新输出只要包含可区分的实际内容维度，就应提供对应 sections**，让用户生成后按维度阅读。例如代码阅读按实际内容提供 deep-read、call-chain、business。最多 5 项，每个 dimension 只能出现一次，同维度内容合并；每项为 `{ dimension, markdown }`，markdown 为该维度非空正文并包含相关证据链接。只呈现本轮真实生成的维度，不为补齐列表编造内容或空维度，也不要求固定顺序；完整 markdown 仍保留全部内容作为回退与导出来源。
+- sections 在 schema 中可省略/default [] 仅为兼容旧请求与档案；**新输出只要包含可区分的实际内容维度，就应提供对应 sections**，让用户生成后按维度阅读。例如代码阅读按实际内容提供 deep-read、call-chain、business。最多 5 项，每个 dimension 只能出现一次，同维度内容合并；每项为 `{ dimension, markdown }`，markdown 为该维度非空正文并包含相关证据链接；每项只承载对应维度，不把整篇主 markdown 复制到每个 section，也不在多个 sections 重复同一段。只呈现本轮真实生成的维度，不为补齐列表编造内容或空维度，也不要求固定顺序；完整 markdown 仍保留全部内容作为回退与导出来源。
 - claims 的 kind 为 fact、inference 或 hypothesis；fact/inference 必须列当前会话有效 evidenceIds，inference 说明前提。
 - nextQuestions 提供 1–3 个贴近当前问题的可选追问，不自动执行。topics 仅在发现候选主题时按需提供。
 - intent=explain 时 mermaid 可选；intent=logic-graph 时必填有效非空图内容。只用普通 sequenceDiagram / flowchart / classDiagram / stateDiagram-v2 / erDiagram；禁止 init、frontmatter、HTML、样式配置、click、外链或 URL。
 
-保存成功后即结束本轮，以简短核心结论和可选追问等待用户，避免重复整篇笔记。发布不改变兼容 stage。保存失败需说明原因，不能声称已归档；重试保持同一调用凭据和相同参数，不将冲突当作成功。
+以 reading_publish 的明确成功响应作为归档成功依据；成功后即结束本轮，以简短核心结论和可选追问等待用户，避免重复整篇笔记。发布不改变兼容 stage。参数或证据校验明确拒绝时，按错误更正参数或重新取证后再调用；不能将冲突当作成功。网络中断或提交结果不明时，说明本轮未确认完成并停下，等待用户核对已有档案；不自行重发写操作，也不猜造或复用不可控制的工具调用 ID。

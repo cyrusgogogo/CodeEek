@@ -9,11 +9,13 @@ import { ANNOTATION_LABELS } from '../anchors.mjs';
 
 const ReaderContext = createContext(null);
 const MAX_OPEN_FILES = 12;
+// Matches the Host full-file view limit, independently of AI excerpt budgets.
+const MAX_FILE_VIEW_LINES = 20000;
 const fileKey = file => JSON.stringify([file.repoId, file.path]);
 const sameFile = (left, right) => !!left && !!right && left.repoId === right.repoId && left.path === right.path;
 const emptyViewport = () => ({ scrollTop: 0, scrollLeft: 0, panelScrollTop: 0 });
 const titleOf = anchor => `${anchor.path}:${anchor.start.line}:${anchor.start.column + 1}–${anchor.end.line}:${anchor.end.column + 1}`;
-export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, enabled, activeDocument = 'source', onOpen, onAnalyze, onGraph, onReading, analyzeDisabled, onController, onContextSelection, children }) {
+export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, enabled, activeDocument = 'source', onOpen, onAnalyze, onGraph, onReading, analyzeDisabled, onController, onContextSelection, onMutation, sessionDraft = false, children }) {
   const [target, setTarget] = useState(null); const [document, setDocument] = useState(null); const [loadState, setLoadState] = useState('idle'); const [error, setError] = useState(''); const [nonce, setNonce] = useState(0); const [openFiles, setOpenFiles] = useState([]);
   const [allNotes, setAllNotes] = useState([]); const [noteRevision, setNoteRevision] = useState(0); const [selected, setSelected] = useState(null); const [draft, setDraft] = useState(null); const [activeNote, setActiveNote] = useState(''); const [rail, setRail] = useState('files'); const [expanded, setExpanded] = useState(() => typeof window !== 'undefined' && !window.matchMedia('(max-width:900px)').matches); const [maximized, setMaximized] = useState(false); const [width, setWidth] = useState(256); const [mutating, setMutating] = useState(false);
   const alive = useRef(false); const viewSeq = useRef(0); const noteSeq = useRef(0); const viewAbort = useRef(null); const noteAbort = useRef(null); const requests = useRef(new Map()); const mutationLock = useRef(false); const current = useRef(null); const methods = useRef(null); const controllerCallback = useRef(onController); const viewerNodes = useRef(new Set()); const pendingScroll = useRef(null); const queuedRestore = useRef(null); const previousSession = useRef(sessionId); const lastScroll = useRef(emptyViewport()); const filePositions = useRef(new Map()); const filesRef = useRef(openFiles); const sessionScope = useRef({ sessionId, epoch: 0 });
@@ -42,20 +44,17 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     viewAbort.current?.abort(); const seq = ++viewSeq.current; const controller = new AbortController(); viewAbort.current = controller; setSelected(null); setDocument(null);
     if (!enabled || !visibleTarget || target.repoId !== repoId) { setLoadState('idle'); return () => controller.abort(); }
     setLoadState('loading'); setError('');
-    void api('view-file', { sessionId, repoId: target.repoId, path: target.path, offset: target.offset, limit: target.limit ?? 200 }, controller.signal).then(value => {
+    void api('view-file', { sessionId, repoId: target.repoId, path: target.path }, controller.signal).then(value => {
       if (!valid(seq, controller)) return;
-      if (value.repoId !== target.repoId || value.path !== target.path || value.offset !== target.offset || typeof value.hash !== 'string' || !Array.isArray(value.lines)) throw new Error('源码响应与请求的位置不一致，请重新加载');
+      if (value.repoId !== target.repoId || value.path !== target.path || value.offset !== 1 || !/^[a-f\d]{64}$/.test(value.hash ?? '') || !Number.isSafeInteger(value.bytes) || value.bytes < 0 || value.bytes > 1048576 || !Number.isSafeInteger(value.totalLines) || value.totalLines < 1 || value.totalLines > MAX_FILE_VIEW_LINES || !Array.isArray(value.lines) || value.lines.length !== value.totalLines || value.lines.length > value.bytes + 1 || value.lines.some((row, index) => row?.number !== index + 1 || typeof row.text !== 'string' || /[\r\n]/.test(row.text)) || value.lines.reduce((chars, row) => chars + row.text.length + 1, -1) > value.bytes) throw new Error('源码响应不是同一版本的完整文件，请重新加载；不会拼接分页');
+      if (target.focusLine > value.totalLines) setTarget(previous => sameFile(previous, target) ? { ...previous, unavailableOffset: target.focusLine } : previous);
       setDocument(value); setLoadState('ready');
     }).catch(e => {
       if (!valid(seq, controller)) return;
-      if (e.code === 'LINE_RANGE' && target.expectedHash && target.offset > 1 && !target.unavailableOffset) {
-        pendingScroll.current = { repoId: target.repoId, path: target.path, offset: 1, scrollTop: 0, scrollLeft: 0 };
-        setTarget(previous => previous?.repoId === target.repoId && previous?.path === target.path && previous?.offset === target.offset ? { ...previous, offset: 1, unavailableOffset: target.offset } : previous); return;
-      }
       setError(e.message); setLoadState('error'); void reloadNotes();
     });
     return () => controller.abort();
-  }, [sessionId, repoId, target?.repoId, target?.path, target?.offset, target?.limit, enabled, nonce]);
+  }, [sessionId, repoId, target?.repoId, target?.path, target?.offset, enabled, nonce]);
   useEffect(() => {
     if (activeDocument !== 'source') { const saved = capturePosition(); if (saved && !pendingScroll.current) pendingScroll.current = positionOnly(saved); }
   }, [activeDocument]);
@@ -64,16 +63,17 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     const frame = requestAnimationFrame(() => {
       const pending = pendingScroll.current;
       if (!pending || pending.repoId !== visibleDocument.repoId || pending.path !== visibleDocument.path || pending.offset !== visibleDocument.offset) return;
-      let applied = false;
+      let applied = null;
       for (const node of viewerNodes.current) {
         const pre = node.querySelector('.cr-code-body'); if (!pre || !node.getClientRects().length) continue;
         const panel = node.closest('.cr-source-document') ?? node;
-        if (pending.focusLine) { const row = node.querySelector(`[data-code-line="${pending.focusLine}"]`); if (row) pre.scrollTop = Math.max(0, row.getBoundingClientRect().top - pre.getBoundingClientRect().top + pre.scrollTop - 48); }
+        if (pending.focusLine) { const row = node.querySelector(`[data-code-line="${pending.focusLine}"]`); const first = node.querySelector('[data-code-line="1"]'); pre.scrollTop = row ? Math.max(0, pending.legacyOffset && first ? row.getBoundingClientRect().top - first.getBoundingClientRect().top + (pending.scrollTop ?? 0) : row.getBoundingClientRect().top - pre.getBoundingClientRect().top + pre.scrollTop - 48) : 0; }
         else pre.scrollTop = pending.scrollTop ?? 0;
         pre.scrollLeft = pending.scrollLeft ?? 0; panel.scrollTop = pending.panelScrollTop ?? 0;
-        if (pending.focusViewer) pre.focus({ preventScroll: true }); applied = true;
+        if (pending.focusViewer) pre.focus({ preventScroll: true });
+        applied = { scrollTop: pre.scrollTop, scrollLeft: pre.scrollLeft, panelScrollTop: panel.scrollTop };
       }
-      if (applied) { lastScroll.current = { scrollTop: pending.scrollTop ?? 0, scrollLeft: pending.scrollLeft ?? 0, panelScrollTop: pending.panelScrollTop ?? 0 }; pendingScroll.current = null; }
+      if (applied) { lastScroll.current = applied; pendingScroll.current = null; }
     });
     return () => cancelAnimationFrame(frame);
   }, [visibleDocument, activeDocument]);
@@ -85,7 +85,7 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
   function browseFiles() { capturePosition(); setRail('files'); setExpanded(true); setMaximized(false); }
   function close() { capturePosition(); setExpanded(false); setMaximized(false); }
   function positionOnly(position) {
-    return { repoId: position.repoId, path: position.path, hash: position.hash ?? null, offset: position.offset, limit: Number.isSafeInteger(position.limit) ? Math.max(1, Math.min(400, position.limit)) : 200, scrollTop: position.scrollTop ?? 0, scrollLeft: position.scrollLeft ?? 0, panelScrollTop: position.panelScrollTop ?? 0 };
+    return { repoId: position.repoId, path: position.path, hash: position.hash ?? null, offset: 1, scrollTop: position.scrollTop ?? 0, scrollLeft: position.scrollLeft ?? 0, panelScrollTop: position.panelScrollTop ?? 0 };
   }
   function rememberPosition(position) {
     if (position && filesRef.current.some(file => sameFile(file, position))) filePositions.current.set(fileKey(position), positionOnly(position));
@@ -109,7 +109,7 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     if (!file || !filesRef.current.some(item => sameFile(item, file))) return false;
     if (sameFile(current.current.target, file)) capturePosition();
     const saved = filePositions.current.get(fileKey(file));
-    return openTarget({ repoId: file.repoId, path: file.path, offset: saved?.offset ?? 1, limit: saved?.limit ?? 200, ...(saved?.hash ? { expectedHash: saved.hash } : {}) }, saved ?? {}, { activate });
+    return openTarget({ repoId: file.repoId, path: file.path, offset: 1, ...(saved?.hash ? { expectedHash: saved.hash } : {}) }, saved ?? {}, { activate });
   }
   // True means the visible source document was closed without a replacement.
   function closeFile(file) {
@@ -124,14 +124,14 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
   }
   function openFile(path, fileRepo = repoId, line = 1) {
     if (typeof path !== 'string' || !path || !Number.isSafeInteger(Number(line)) || Number(line) < 1) return false;
-    return openTarget({ repoId: fileRepo, path, offset: Number(line) });
+    return openTarget({ repoId: fileRepo, path, offset: 1, focusLine: Number(line) }, Number(line) > 1 ? { focusLine: Number(line) } : {});
   }
   function openEvidence(source) {
     const evidence = source?.evidence;
     if (!evidence || (evidence.sessionId && evidence.sessionId !== sessionId) || typeof evidence.path !== 'string' || !/^[a-f\d]{64}$/i.test(evidence.hash ?? '') || !Number.isSafeInteger(evidence.startLine) || !Number.isSafeInteger(evidence.endLine) || evidence.startLine < 1 || evidence.endLine < evidence.startLine || !repositories.some(repo => repo.id === evidence.repoId)) { setError('证据位置无效或不属于当前阅读会话'); return false; }
-    const range = evidence.endLine - evidence.startLine + 1; const offset = Math.max(1, evidence.startLine - (range < 390 ? 5 : 0));
-    // API excerpts are not a file snapshot. Re-read the actual file and compare SHA256 before highlighting.
-    return openTarget({ repoId: evidence.repoId, path: evidence.path, offset, limit: Math.min(400, Math.max(200, range + 10)), expectedHash: evidence.hash, evidence: { id: evidence.id, sessionId, repoId: evidence.repoId, path: evidence.path, hash: evidence.hash, startLine: evidence.startLine, endLine: evidence.endLine, symbol: evidence.symbol ?? '', stale: source.stale === true, reason: source.reason ?? '' } }, { focusLine: evidence.startLine });
+    // API excerpts are not a file snapshot. Read the whole checked file once;
+    // compare SHA256 before highlighting and scroll locally to the cited line.
+    return openTarget({ repoId: evidence.repoId, path: evidence.path, offset: 1, focusLine: evidence.startLine, expectedHash: evidence.hash, evidence: { id: evidence.id, sessionId, repoId: evidence.repoId, path: evidence.path, hash: evidence.hash, startLine: evidence.startLine, endLine: evidence.endLine, symbol: evidence.symbol ?? '', stale: source.stale === true, reason: source.reason ?? '' } }, { focusLine: evidence.startLine });
   }
   function rememberViewport(node) {
     const pre = node?.querySelector('.cr-code-body'); const now = current.current;
@@ -141,7 +141,7 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     const now = current.current; if (!now.target) return null;
     for (const node of viewerNodes.current) { const pre = node.querySelector('.cr-code-body'); if (pre && node.getClientRects().length) { lastScroll.current = { scrollTop: pre.scrollTop, scrollLeft: pre.scrollLeft, panelScrollTop: (node.closest('.cr-source-document') ?? node).scrollTop }; break; } }
     const matching = sameFile(now.document, now.target) && now.document.offset === now.target.offset;
-    const position = { repoId: now.target.repoId, path: now.target.path, hash: matching ? now.document.hash : now.target.expectedHash ?? null, offset: now.target.offset, limit: now.target.limit ?? 200, ...lastScroll.current, rail: now.rail, expanded: now.expanded, maximized: now.maximized, width: now.width, ...(now.target.evidence ? { evidence: { ...now.target.evidence } } : {}) };
+    const position = { repoId: now.target.repoId, path: now.target.path, hash: matching ? now.document.hash : now.target.expectedHash ?? null, offset: 1, ...lastScroll.current, rail: now.rail, expanded: now.expanded, maximized: now.maximized, width: now.width, ...(now.target.evidence ? { evidence: { ...now.target.evidence } } : {}) };
     rememberPosition(position); return position;
   }
   function restorePosition(position, { activate = true } = {}) {
@@ -149,7 +149,10 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     if (!enabled) { queuedRestore.current = { sessionId, position: structuredClone(position), activate }; return true; }
     const viewport = {}; for (const key of ['scrollTop', 'scrollLeft', 'panelScrollTop']) viewport[key] = Number.isFinite(position[key]) && position[key] >= 0 ? position[key] : 0;
     const evidence = position.evidence?.sessionId === sessionId && position.evidence.repoId === position.repoId && position.evidence.path === position.path ? { ...position.evidence } : undefined;
-    if (!openTarget({ repoId: position.repoId, path: position.path, offset: position.offset, limit: evidence ? Math.min(400, Math.max(200, evidence.endLine - position.offset + 1)) : 200, expectedHash: evidence?.hash ?? position.hash ?? undefined, ...(evidence ? { evidence } : {}) }, viewport, { activate })) return false;
+    // Old archives stored a page start plus a page-relative scroll offset.
+    // Restore that metadata as an anchor in the newly checked complete file.
+    if (position.offset > 1) { viewport.focusLine = position.offset; viewport.legacyOffset = true; }
+    if (!openTarget({ repoId: position.repoId, path: position.path, offset: 1, ...(position.offset > 1 ? { focusLine: position.offset } : {}), expectedHash: evidence?.hash ?? position.hash ?? undefined, ...(evidence ? { evidence } : {}) }, viewport, { activate })) return false;
     if (['files', 'notes'].includes(position.rail)) setRail(position.rail);
     if (typeof position.expanded === 'boolean' && (!activate || !window.matchMedia('(max-width:900px)').matches)) setExpanded(position.expanded);
     setMaximized(position.maximized === true); if (Number.isFinite(position.width)) setWidth(Math.max(200, Math.min(420, position.width))); return true;
@@ -165,14 +168,14 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     const validMutation = () => alive.current && current.current.enabled && current.current.sessionId === sessionId && sessionScope.current.epoch === epoch;
     try {
       const result = await api(method, { sessionId, requestId, ...params });
-      if (!validMutation()) return; requests.current.delete(key); setDraft(null); setActiveNote(result.item.id); setAllNotes(previous => [...previous.filter(item => item.id !== result.item.id), { ...result.item, location: { status: 'unchecked', needsReview: result.item.needsReview } }]); await reloadNotes(); if (validMutation()) reloadFile();
+      if (!validMutation()) return; requests.current.delete(key); setDraft(null); setActiveNote(result.item.id); setAllNotes(previous => [...previous.filter(item => item.id !== result.item.id), { ...result.item, location: { status: 'unchecked', needsReview: result.item.needsReview } }]); await onMutation?.(sessionId); if (!validMutation()) return; await reloadNotes(); if (validMutation()) reloadFile();
     } catch (e) { if (validMutation()) setError(e.message + '。结果不确定时，先刷新批注；相同操作重试会沿用请求凭据。'); }
     finally { mutationLock.current = false; if (alive.current) setMutating(false); }
   }
   function annotate(selection) { if (mutationLock.current || !enabled) return; setDraft({ selection: structuredClone(selection), body: '' }); setRail('notes'); setExpanded(true); setMaximized(false); }
   function reveal(note) { setActiveNote(note.id); const point = note.location?.candidate?.start ?? note.anchor.start; openFile(note.anchor.path, note.anchor.repoId, Math.max(1, point.line - 5)); }
   function pinContext(selection) { if (selection && enabled) onContextSelection?.(structuredClone(selection)); }
-  const value = { enabled, sessionId, repositories, repoId, onRepoChange, activeDocument, target: visibleTarget, document: visibleDocument, loadState: currentSession ? loadState : 'idle', error: currentSession ? error : '', setError, selected: currentSession ? selected : null, setSelected, draft: currentSession ? draft : null, setDraft, activeNote: currentSession ? activeNote : '', setActiveNote, rail, setRail, expanded, setExpanded, maximized, setMaximized, width, setWidth, mutating, notes, openFiles, activateFile, closeFile, openFile, reloadFile, reloadNotes, annotate, reveal, mutate, onAnalyze, onGraph, onReading, analyzeDisabled, pinContext, browseFiles, showSource, viewerNodes, rememberViewport };
+  const value = { enabled, sessionId, sessionDraft, repositories, repoId, onRepoChange, activeDocument, target: visibleTarget, document: visibleDocument, loadState: currentSession ? loadState : 'idle', error: currentSession ? error : '', setError, selected: currentSession ? selected : null, setSelected, draft: currentSession ? draft : null, setDraft, activeNote: currentSession ? activeNote : '', setActiveNote, rail, setRail, expanded, setExpanded, maximized, setMaximized, width, setWidth, mutating, notes, openFiles, activateFile, closeFile, openFile, reloadFile, reloadNotes, annotate, reveal, mutate, onAnalyze, onGraph, onReading, analyzeDisabled, pinContext, browseFiles, showSource, viewerNodes, rememberViewport };
   return <ReaderContext.Provider value={value}>{children}</ReaderContext.Provider>;
 }
 export function DocumentTabs({ activeDocument, readingDocuments = [], activeSessionId, onReading, onCloseReading, onEmpty }) {
@@ -203,42 +206,47 @@ export function DocumentTabs({ activeDocument, readingDocuments = [], activeSess
     </div>)}
   </nav>;
 }
-function Directory({ path = '', label = '仓库根目录', depth = 0, collapseVersion = 0 }) {
-  const reader = useContext(ReaderContext);
-  const [open, setOpen] = useState(path === '');
+function Directory({ path = '', label = '仓库根目录', repoId, rootPath = '', depth = 0, collapseVersion = 0 }) {
+  const reader = useContext(ReaderContext); const active = reader.repoId === repoId;
+  const [open, setOpen] = useState(path === '' && active); const expanded = active && open;
   const [entries, setEntries] = useState([]); const [next, setNext] = useState(null); const [budget, setBudget] = useState(false);
-  const [loading, setLoading] = useState(false); const [error, setError] = useState('');
-  const groupId = useId();
+  const [loading, setLoading] = useState(false); const [error, setError] = useState(''); const groupId = useId();
   const alive = useRef(false); const sequence = useRef(0); const abort = useRef(null); const locked = useRef(false);
+  const scope = useRef({ sessionId: reader.sessionId, repoId, path, active, enabled: reader.enabled });
+  const previous = scope.current;
+  if (previous.sessionId !== reader.sessionId || previous.repoId !== repoId || previous.path !== path || previous.active !== active || previous.enabled !== reader.enabled) scope.current = { sessionId: reader.sessionId, repoId, path, active, enabled: reader.enabled };
   useEffect(() => { alive.current = true; return () => { alive.current = false; abort.current?.abort(); ++sequence.current; }; }, []);
+  useEffect(() => { if (!path) setOpen(active); }, [active]);
   useEffect(() => { if (path) setOpen(false); }, [collapseVersion]);
   async function load(offset = 0) {
-    if (locked.current) return; locked.current = true; const seq = ++sequence.current; abort.current?.abort(); const controller = new AbortController(); abort.current = controller; setLoading(true); setError('');
-    try { const result = await api('tree', { sessionId: reader.sessionId, repoId: reader.repoId, directory: path, offset }, controller.signal); if (!alive.current || controller.signal.aborted || seq !== sequence.current) return; setEntries(previous => offset ? [...previous, ...result.entries] : result.entries); setNext(result.nextOffset); setBudget(result.budgetTruncated); }
-    catch (e) { if (alive.current && !controller.signal.aborted && seq === sequence.current) setError(e.message); }
+    if (locked.current || !active || !reader.enabled) return;
+    locked.current = true; const token = scope.current; const seq = ++sequence.current; abort.current?.abort(); const controller = new AbortController(); abort.current = controller; setLoading(true); setError('');
+    const valid = () => alive.current && !controller.signal.aborted && seq === sequence.current && scope.current === token && token.active && token.enabled;
+    try {
+      const result = await api('tree', { sessionId: token.sessionId, repoId, directory: path, offset }, controller.signal);
+      if (!valid()) return;
+      if (result.repoId !== repoId || result.directory !== path || !Array.isArray(result.entries)) throw new Error('目录响应与仓库身份不一致，请刷新目录');
+      setEntries(old => offset ? [...old, ...result.entries] : result.entries); setNext(result.nextOffset); setBudget(result.budgetTruncated);
+    } catch (e) { if (valid()) setError(e.message); }
     finally { if (seq === sequence.current) { locked.current = false; if (alive.current) setLoading(false); } }
   }
-  useEffect(() => { if (open) void load(); else { abort.current?.abort(); ++sequence.current; locked.current = false; setLoading(false); } }, [open]);
-  return <div className="cr-directory" data-directory-path={path}>
-    <button type="button" className={`cr-tree-folder${path ? '' : ' cr-tree-root'}`} title={path || '仓库根目录'} aria-expanded={open} aria-controls={groupId} onClick={() => setOpen(value => !value)}>
-      <UiIcon name="chevron-right" size={14} className={`cr-tree-chevron${open ? ' cr-tree-chevron-open' : ''}`} />
-      <EntryIcon path={path} folder open={open} root={!path} />
+  useEffect(() => { if (expanded && reader.enabled) void load(); else { abort.current?.abort(); ++sequence.current; locked.current = false; setLoading(false); } }, [expanded, reader.enabled, reader.sessionId, repoId]);
+  return <div className="cr-directory" data-directory-path={path} data-repo-id={repoId}>
+    <button type="button" className={`cr-tree-folder${path ? '' : ' cr-tree-root'}`} data-repo-id={repoId} title={path || rootPath || '仓库根目录'} aria-label={!path ? `${label} · ${rootPath || repoId}` : undefined} aria-current={!path && active ? 'true' : undefined} aria-expanded={expanded} aria-controls={groupId} onClick={() => { if (!active) { setOpen(true); reader.onRepoChange(repoId); } else setOpen(value => !value); }}>
+      <UiIcon name="chevron-right" size={14} className={`cr-tree-chevron${expanded ? ' cr-tree-chevron-open' : ''}`} />
+      <EntryIcon path={path} folder open={expanded} root={!path} />
       <span className="cr-tree-name">{label}</span>{!path && <span className="cr-tree-root-tag">根目录</span>}
     </button>
-
-    {open && <div className="cr-tree-children" id={groupId}>
+    {expanded && <div className="cr-tree-children" id={groupId}>
       {loading && <p className="cr-tree-feedback" role="status">正在加载目录…</p>}
-      {error && <div role="alert" className="cr-tree-feedback cr-error">{error}<button type="button" onClick={() => load()}>重试目录</button>
-</div>}
+      {error && <div role="alert" className="cr-tree-feedback cr-error">{error}<button type="button" onClick={() => load()}>重试目录</button></div>}
       {entries.map(entry => entry.kind === 'directory'
-        ? depth < 32 ? <Directory key={entry.path} path={entry.path} label={entry.name} depth={depth + 1} collapseVersion={collapseVersion} /> : <p className="cr-tree-feedback" key={entry.path}>目录层级过深，请用路径检索。</p>
-        : <button type="button" className="cr-tree-file" key={entry.path} title={entry.path} aria-current={reader.target?.path === entry.path && reader.target?.repoId === reader.repoId ? 'true' : undefined} onClick={() => reader.openFile(entry.path)}>
+        ? depth < 32 ? <Directory key={entry.path} path={entry.path} label={entry.name} repoId={repoId} depth={depth + 1} collapseVersion={collapseVersion} /> : <p className="cr-tree-feedback" key={entry.path}>目录层级过深，请用路径检索。</p>
+        : <button type="button" className="cr-tree-file" key={entry.path} data-repo-id={repoId} title={entry.path} aria-current={reader.target?.path === entry.path && reader.target?.repoId === repoId ? 'true' : undefined} onClick={() => reader.openFile(entry.path, repoId)}>
           <span className="cr-tree-spacer" aria-hidden="true" /><EntryIcon path={entry.path} /><span className="cr-tree-name">{entry.name}</span>
-        </button>
-)}
+        </button>)}
       {!loading && !error && !entries.length && <p className="cr-muted cr-tree-feedback">无可浏览文件（敏感项和链接不显示）。</p>}
-      {next !== null && <button className="cr-tree-more" type="button" disabled={loading} onClick={() => load(next)}>加载更多目录项</button>
-}
+      {next !== null && <button className="cr-tree-more" type="button" disabled={loading} onClick={() => load(next)}>加载更多目录项</button>}
       {budget && <p className="cr-muted cr-tree-feedback">目录扫描达到上限，列表不完整，请缩小路径范围。</p>}
     </div>}
   </div>;
@@ -273,7 +281,7 @@ function navigateDirectory(event) {
   target?.focus({ preventScroll: true }); target?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 function FileSearch() {
-  const r = useContext(ReaderContext); const [query, setQuery] = useState(''); const [results, setResults] = useState(null); const [loading, setLoading] = useState(false); const [error, setError] = useState(''); const sequence = useRef(0); const abort = useRef(null); const current = useRef(null); const alive = useRef(false);
+  const r = useContext(ReaderContext); const hintId = useId(); const [query, setQuery] = useState(''); const [results, setResults] = useState(null); const [loading, setLoading] = useState(false); const [error, setError] = useState(''); const sequence = useRef(0); const abort = useRef(null); const current = useRef(null); const alive = useRef(false);
   current.current = { sessionId: r.sessionId, repoId: r.repoId, enabled: r.enabled };
   useEffect(() => { alive.current = true; return () => { alive.current = false; abort.current?.abort(); ++sequence.current; }; }, []);
   useEffect(() => { abort.current?.abort(); ++sequence.current; setResults(null); setLoading(false); setError(''); }, [r.sessionId, r.repoId, r.enabled]);
@@ -289,7 +297,7 @@ function FileSearch() {
     } catch (e) { if (valid()) setError(e.message); }
     finally { if (valid()) setLoading(false); }
   }
-  return <section className="cr-file-search" aria-label="仓库源码检索"><form onSubmit={event => { event.preventDefault(); void search('search'); }}><input aria-label="检索内容或路径" maxLength={200} value={query} onChange={event => setQuery(event.target.value)} placeholder="查找代码内容或文件路径" /><div className="cr-file-search-actions"><button type="submit" disabled={loading || !query.trim()}>搜索内容</button><button type="button" disabled={loading || !query.trim()} onClick={() => void search('files')}>按路径查找</button></div></form>{loading && <p role="status">正在检索…</p>}{error && <p className="cr-error" role="alert">{error}</p>}{results && <div className="cr-file-search-results">{results.truncated && <p className="cr-muted">结果或扫描范围已截断，请缩小检索范围。</p>}{!results.items.length && <p className="cr-muted">没有匹配项。</p>}{results.items.map((item, index) => <button type="button" className="cr-evidence" key={`${item.repoId}:${item.path}:${item.line ?? index}`} title={item.path} onClick={() => r.openFile(item.path, item.repoId, item.line ?? 1)}>{item.path}{item.line ? `:${item.line}` : ''}{item.text && <small>{item.text}</small>}</button>)}</div>}</section>;
+  return <section className="cr-file-search" aria-label="仓库源码检索" aria-busy={loading}><form onSubmit={event => { event.preventDefault(); void search('search'); }}><input type="search" aria-label="检索内容或路径" aria-describedby={hintId} title="回车搜索内容；Shift+Enter 按路径查找" maxLength={200} value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void search('files'); } }} placeholder="查找代码内容或文件路径" /><span className="cr-sr-only" id={hintId}>回车搜索内容；Shift+Enter 按路径查找。</span></form>{loading && <p role="status">正在检索…</p>}{error && <p className="cr-error" role="alert">{error}</p>}{results && <div className="cr-file-search-results">{results.truncated && <p className="cr-muted">结果或扫描范围已截断，请缩小检索范围。</p>}{!results.items.length && <p className="cr-muted">没有匹配项。</p>}{results.items.map((item, index) => <button type="button" className="cr-evidence" key={`${item.repoId}:${item.path}:${item.line ?? index}`} title={item.path} onClick={() => r.openFile(item.path, item.repoId, item.line ?? 1)}>{item.path}{item.line ? `:${item.line}` : ''}{item.text && <small>{item.text}</small>}</button>)}</div>}</section>;
 }
 export function FileRail() {
   const r = useContext(ReaderContext); const [all, setAll] = useState(false);
@@ -311,28 +319,26 @@ export function FileRail() {
 </nav>
     <div className="cr-extension-content">{r.error && <p role="alert" className="cr-banner cr-error">{r.error}</p>}
       <div className="cr-explorer-panel" hidden={r.rail !== 'files'}>
-        <label className="cr-repo-picker"><span>当前仓库</span><select aria-label="文件目录仓库" value={r.repoId} onChange={e => r.onRepoChange(e.target.value)}>{r.repositories.map(repo => <option key={repo.id} value={repo.id}>{repo.name}</option>)}</select></label>
         <FileSearch />
         <div className="cr-explorer-toolbar"><span>仓库文件</span><div><button type="button" className="cr-icon-button" aria-label="刷新文件目录" title="刷新文件目录" onClick={() => setTreeVersion(value => value + 1)}><UiIcon name="refresh-cw" size={15} /></button>
 <button type="button" className="cr-icon-button" aria-label="收起子目录" title="收起子目录" onClick={() => setCollapseVersion(value => value + 1)}><UiIcon name="chevrons-down-up" size={15} /></button>
 </div></div>
-        <div className="cr-file-tree" role="group" aria-label="仓库文件目录" onKeyDown={navigateDirectory}>{filesOpened && r.repoId && <Directory key={`${r.sessionId}:${r.repoId}:${treeVersion}`} label={r.repositories.find(repo => repo.id === r.repoId)?.name ?? '仓库根目录'} collapseVersion={collapseVersion} />}</div>
-        <footer className="cr-explorer-footer"><span><UiIcon name="shield-check" size={14} />只读浏览，不修改源码</span><span><kbd>↑</kbd><kbd>↓</kbd> 导航 <span className="cr-key-separator">·</span> 单击文件打开</span></footer>
+        <div className="cr-file-tree" role="group" aria-label="仓库文件目录" data-multi-repo={r.repositories.length > 1 ? 'true' : undefined} onKeyDown={navigateDirectory}>{filesOpened && r.repositories.map(repo => <Directory key={`${r.sessionId}:${repo.id}:${treeVersion}`} label={repo.name} repoId={repo.id} rootPath={repo.root} collapseVersion={collapseVersion} />)}</div>
       </div><div className="cr-notes-panel" hidden={r.rail !== 'notes'}><div className="cr-row"><label><input type="checkbox" checked={all} onChange={e => setAll(e.target.checked)} /> 本会话全部</label><button type="button" disabled={r.mutating} onClick={async () => { await r.reloadNotes(); r.reloadFile(); }}>刷新批注</button>
-</div><p className="cr-muted">批注只写阅读工作区。哈希变化后须人工复核，不把候选位置当作已确认。</p>{r.draft && <section className="cr-annotation-editor"><strong>新批注</strong><p className="cr-path">{titleOf(r.draft.selection)}</p><textarea aria-label="批注内容" disabled={r.mutating} maxLength={4000} rows={6} value={r.draft.body} onChange={e => r.setDraft({ ...r.draft, body: e.target.value })} placeholder="记录解释、疑问或边界条件；不会修改源码" /><small>保存选区及附近上下文快照（包含代码）。不自动发给模型。</small><div className="cr-row"><button type="button" className="cr-primary" disabled={r.mutating || !r.draft.body.trim()} onClick={() => r.mutate('annotation-create', { body: r.draft.body, selection: r.draft.selection })}>保存批注</button>
+</div><p className="cr-muted">批注只写阅读工作区。哈希变化后须人工复核，不把候选位置当作已确认。</p>{r.draft && <section className="cr-annotation-editor"><strong>新批注</strong><p className="cr-path">{titleOf(r.draft.selection)}</p><textarea aria-label="批注内容" disabled={r.mutating} maxLength={4000} rows={6} value={r.draft.body} onChange={e => r.setDraft({ ...r.draft, body: e.target.value })} placeholder="记录解释、疑问或边界条件；不会修改源码" /><small>保存选区及附近上下文快照（包含代码）。不自动发给模型。{r.sessionDraft && '保存批注也会保留这条阅读会话。'}</small><div className="cr-row"><button type="button" className="cr-primary" disabled={r.mutating || !r.draft.body.trim()} onClick={() => r.mutate('annotation-create', { body: r.draft.body, selection: r.draft.selection })}>保存批注</button>
 <button type="button" disabled={r.mutating} onClick={() => r.setDraft(null)}>取消批注</button>
 </div></section>}{!filtered.length && <p className="cr-muted">{r.target ? '当前范围没有批注。选择代码后右键添加，或查看本会话全部。' : '先打开一个文件，选择代码后右键添加。'}</p>}{filtered.map(item => <button type="button" className="cr-annotation-card" aria-pressed={r.activeNote === item.id} key={item.id} onClick={() => r.setActiveNote(item.id)}><span className={`cr-annotation-state ${item.location?.status === 'current' ? 'cr-annotation-current' : ''}`}>{ANNOTATION_LABELS[item.location?.status] ?? ANNOTATION_LABELS.unchecked}</span><strong>{item.body.slice(0, 140)}</strong><small>{titleOf(item.anchor)}</small></button>
 )}{active && <section className="cr-annotation-detail"><h3>批注详情 · v{active.revision}</h3><p className="cr-annotation-body">{active.body}</p><p className="cr-path">{titleOf(active.anchor)}<br />SHA256 {active.anchor.fileHash}</p><p className="cr-muted">{ANNOTATION_LABELS[active.location?.status] ?? ANNOTATION_LABELS.unchecked}</p><button type="button" onClick={() => r.reveal(active)}>打开锚定文件 / 候选位置</button>
 {active.location?.candidate && active.location.status !== 'current' && r.document?.hash && active.anchor.repoId === r.document.repoId && active.anchor.path === r.document.path && <button type="button" disabled={r.mutating} onClick={() => r.mutate('annotation-update', { annotationId: active.id, expectedRevision: active.revision, operation: 'confirm', expectedFileHash: r.document.hash })}>我已复核，确认本版本</button>
 }<button type="button" disabled={r.mutating || !r.selected} onClick={() => r.mutate('annotation-update', { annotationId: active.id, expectedRevision: active.revision, operation: 'rebind', selection: r.selected })}>重新绑定到当前选区</button>
-<p className="cr-muted">重新绑定前，请先在目标文件选中代码；旧版本仍保留。</p><details><summary>历史选区与绑定记录（{active.history.length}）</summary>{[...active.history].reverse().map((version, index) => <section className="cr-annotation-version" key={version.requestId}><small>v{active.history.length - index} · {version.operation} · {new Date(version.time).toLocaleString()}</small><p className="cr-path">{titleOf(version.anchor)} · {version.anchor.fileHash.slice(0, 16)}…</p><CodeBlock text={version.anchor.quote} pathHint={version.anchor.path} startLine={version.anchor.start.line} title="历史选区快照（非当前完整行）" /></section>)}</details></section>}</div></div><footer className="cr-file-sidebar-size-controls cr-source-size-controls"><span>只读 · 不执行仓库脚本</span><button type="button" aria-label="缩窄文件目录" disabled={r.width <= 200} onClick={() => resize(r.width - 32)}>缩窄</button>
+<p className="cr-muted">重新绑定前，请先在目标文件选中代码；旧版本仍保留。</p><details><summary>历史选区与绑定记录（{active.history.length}）</summary>{[...active.history].reverse().map((version, index) => <section className="cr-annotation-version" key={version.requestId}><small>v{active.history.length - index} · {version.operation} · {new Date(version.time).toLocaleString()}</small><p className="cr-path">{titleOf(version.anchor)} · {version.anchor.fileHash.slice(0, 16)}…</p><CodeBlock text={version.anchor.quote} pathHint={version.anchor.path} startLine={version.anchor.start.line} title="历史选区快照（非当前完整行）" /></section>)}</details></section>}</div></div><footer className="cr-file-sidebar-size-controls cr-source-size-controls"><button type="button" aria-label="缩窄文件目录" disabled={r.width <= 200} onClick={() => resize(r.width - 32)}>缩窄</button>
 <button type="button" aria-label="加宽文件目录" disabled={r.width >= 420} onClick={() => resize(r.width + 32)}>加宽</button>
 </footer></div></aside>;
 }
 export function FileViewer({ embedded = false }) {
-  const r = useContext(ReaderContext); const frame = useRef(null); const viewer = useRef(null); const menuRoot = useRef(null); const [menu, setMenu] = useState(null); const [jump, setJump] = useState('1'); const [fontSize, setFontSize] = useState(13);
-  const identity = `${r.sessionId}:${r.repoId}:${r.target?.repoId}:${r.target?.path}:${r.target?.offset}:${r.document?.repoId}:${r.document?.path}:${r.document?.hash}:${r.document?.offset}`;
-  useEffect(() => { setMenu(null); setJump(String(r.document?.offset ?? 1)); }, [identity]);
+  const r = useContext(ReaderContext); const frame = useRef(null); const viewer = useRef(null); const menuRoot = useRef(null); const [menu, setMenu] = useState(null); const [fontSize, setFontSize] = useState(13);
+  const identity = `${r.sessionId}:${r.repoId}:${r.target?.repoId}:${r.target?.path}:${r.document?.repoId}:${r.document?.path}:${r.document?.hash}`;
+  useEffect(() => { setMenu(null); }, [identity]);
   useEffect(() => {
     if (r.activeDocument !== 'source') {
       setMenu(null);
@@ -377,7 +383,6 @@ export function FileViewer({ embedded = false }) {
     {r.error && r.loadState !== 'error' && <p className="cr-banner cr-error" role="alert">{r.error}</p>}
     {doc && <>
       <div className="cr-source-location"><details><summary title={`当前 SHA256：${doc.hash}`}>当前文件 SHA256 {doc.hash.slice(0, 12)}… · 版本详情</summary><strong title={doc.repoId}>{repo?.name ?? doc.repoId} / <span className="cr-path" title={doc.path}>{doc.path}</span></strong><span className="cr-path">仓库：{doc.repoId}<br />当前 SHA256：{doc.hash}</span>{evidence && <span className="cr-path">取证 SHA256：{evidence.hash}</span>}<span>UTF-8 · {doc.bytes.toLocaleString()} 字节 · {doc.totalLines.toLocaleString()} 行</span></details></div>
-      <div className="cr-file-navigation"><button type="button" disabled={doc.offset <= 1} onClick={() => r.openFile(doc.path, doc.repoId, Math.max(1, doc.offset - 200))}>上一段</button><span>第 {doc.offset}–{doc.lines.at(-1)?.number} 行</span><button type="button" disabled={!doc.lines.length || doc.lines.at(-1)?.number >= doc.totalLines} onClick={() => r.openFile(doc.path, doc.repoId, doc.lines.at(-1).number + 1)}>下一段</button><label>跳到行<input aria-label="跳转文件行号" type="number" min="1" max={doc.totalLines} value={jump} onChange={event => setJump(event.target.value)} /></label><button type="button" onClick={() => { const line = Number(jump); if (Number.isInteger(line) && line >= 1 && line <= doc.totalLines) r.openFile(doc.path, doc.repoId, line); }}>跳转</button></div>
       <p className="cr-muted cr-source-selection-help" title="界面只记录所选文字范围；分析代码时模型会补读所属完整方法／函数，按源码版本、行列与完整证据核验，非 AST。浏览其他文件不会替换已固定的提问上下文。">选中代码，右键生成逻辑图；悬停已有 AI 解读的范围查看结论。</p>
       {selected && <div className="cr-selection-actions"><span className="cr-selected-hint" role="status">已选择 {selected.start.line}–{selected.end.line} 行 · {selected.quote.length} 字符</span><button type="button" onClick={() => r.pinContext(selected)}>用于追问</button><button type="button" disabled={!!r.analyzeDisabled || !r.onAnalyze} title={r.analyzeDisabled || '发送选区与上下文给当前已确认模型'} onClick={() => void r.onAnalyze?.(structuredClone(selected))}>解释这段</button><button type="button" onClick={() => r.annotate(selected)}>添加批注</button></div>}
       <div ref={viewer} className="cr-source-scroll" onMouseUp={onSelection} onKeyUp={onSelection} onContextMenu={contextMenu} onKeyDown={event => { if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) contextMenu(event); }}><CodeBlock text={doc.lines.map(row => row.text).join('\n')} pathHint={doc.path} title={doc.path} startLine={doc.offset} markers={markers} evidenceRange={highlight} fontSize={fontSize} onFontSizeChange={setFontSize} codeReadings={doc.codeReadings} readingIdentity={identity} readingsEnabled={r.enabled && r.activeDocument === 'source' && !menu} onOpenReading={item => r.onReading?.(item.sessionId, item.lessonId)} onMarker={id => { r.setActiveNote(id); r.setRail('notes'); r.setExpanded(true); r.setMaximized(false); }} /></div>

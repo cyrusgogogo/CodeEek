@@ -1,12 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { createProjectSchema, readSchema, filesSchema, searchSchema, publishSchema, changeStageSchema, readerStateSchema, updateReaderStateSchema, readingModeSchema, promptIntentSchema, idSchema, STAGE_LABELS, validateMermaid, fail } from './contracts.mjs';
+import { z } from 'zod';
+import { createProjectSchema, readSchema, filesSchema, searchSchema, publishSchema, changeStageSchema, readerStateSchema, updateReaderStateSchema, readingModeSchema, promptIntentSchema, modelSchema, idSchema, STAGE_LABELS, validateMermaid, fail } from './contracts.mjs';
 import { bindDirectory, checkBinding, checkPlain, assertDisjoint, contains, safeRelative, readRepository, listRepository, ensurePlainDirectory, atomicText, appendAudit, digest } from './filesystem.mjs';
 
 import { loadAnnotations } from './workspace.mjs';
 import { annotationMarkdown } from './anchors.mjs';
 import { parseReadingFocus, restoredCodeUnits, verifyCodeUnits, codeUnitsMarkdown } from './code-units.mjs';
+import { modelRefSchema } from './preferences.mjs';
 const makeId = prefix => `${prefix}-${randomUUID()}`;
 const clone = value => structuredClone(value);
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
@@ -19,7 +21,7 @@ export function setRuntime(root, runtime) { RUNTIMES.set(root, runtime); }
 export function getRuntime(root) { const runtime = RUNTIMES.get(root); if (!runtime) fail('READING_UNAVAILABLE', '阅读模式 Host 未启动'); return runtime; }
 
 export class ReadingStore {
-  constructor(root) { this.root = path.resolve(root); this.projects = new Map(); this.sessions = new Map(); this.locks = new Map(); this.diagnostics = []; this.archiveErrors = new Map(); }
+  constructor(root) { this.root = path.resolve(root); this.projects = new Map(); this.sessions = new Map(); this.locks = new Map(); this.diagnostics = []; this.archiveErrors = new Map(); this.draftReadAudits = new Map(); }
   async init() {
     await ensurePlainDirectory(this.root); this.storageBinding = await bindDirectory(this.root);
     await ensurePlainDirectory(path.join(this.root, 'projects'));
@@ -31,14 +33,20 @@ export class ReadingStore {
         const project = JSON.parse(await fs.readFile(file, 'utf8'));
         if (project.id !== entry.name || project.bindingRevision !== 1 || !Array.isArray(project.repositories) || project.repositories.length > 12) fail('CORRUPT_PROJECT', '阅读项目档案无效');
         for (const repo of project.repositories) { idSchema.parse(repo.id); assertDisjoint(this.root, repo.root); }
+        if (project.removedAt != null && (typeof project.removedAt !== 'string' || !Number.isFinite(Date.parse(project.removedAt)))) fail('CORRUPT_PROJECT', '仓库移除状态无效');
         this.projects.set(project.id, project);
+        if (project.removedAt) continue; // Keep archives on disk; removed bindings cannot be reopened by stale sessions.
         const dir = path.join(this.projectDir(project.id), 'sessions'); await checkPlain(dir);
         for (const folder of await fs.readdir(dir, { withFileTypes: true })) {
           if (!folder.isDirectory() || !folder.name.startsWith('reading-')) continue;
           idSchema.parse(folder.name);
-          const stateFile = path.join(dir, folder.name, 'state.json'); await checkPlain(stateFile);
+          const stateFile = path.join(dir, folder.name, 'state.json');
+          try { await checkPlain(stateFile); } catch (error) { if (error.code !== 'ENOENT') throw error; this.diagnostics.push(`${folder.name}: 阅读会话尚未提交，已跳过孤立目录`); continue; }
           const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
           if (state.id !== folder.name || state.projectId !== project.id || !Number.isSafeInteger(state.revision) || !Array.isArray(state.evidence) || !Array.isArray(state.lessons) || !Array.isArray(state.messageRefs)) fail('CORRUPT_SESSION', '阅读会话档案无效');
+          state.draft = false;
+          state.archivedAt = typeof state.archivedAt === 'string' && Number.isFinite(Date.parse(state.archivedAt)) ? state.archivedAt : null;
+          state.archiveRevision = Number.isSafeInteger(state.archiveRevision) && state.archiveRevision >= 0 ? state.archiveRevision : 0;
           state.readerState = this.restoredReaderState(state);
           state.readingMode = readingModeSchema.safeParse(state.readingMode).data ?? 'question';
           state.intent = promptIntentSchema.safeParse(state.intent).data ?? 'explain';
@@ -56,15 +64,18 @@ export class ReadingStore {
   }
   projectDir(id) { idSchema.parse(id); return path.join(this.root, 'projects', id); }
   sessionDir(id) { const state = this.session(id); return path.join(this.projectDir(state.projectId), 'sessions', id); }
-  session(id) { idSchema.parse(id); const state = this.sessions.get(id); if (!state) fail('READING_NOT_FOUND', '没有此阅读会话，请从阅读代码页面新建'); return state; }
-  project(id) { idSchema.parse(id); const project = this.projects.get(id); if (!project) fail('PROJECT_NOT_FOUND', '阅读项目不存在'); return project; }
+  session(id) { idSchema.parse(id); const state = this.sessions.get(id); if (!state) fail('READING_NOT_FOUND', '没有此阅读会话，请从阅读代码页面新建'); this.project(state.projectId); return state; }
+  project(id) { idSchema.parse(id); const project = this.projects.get(id); if (!project) fail('PROJECT_NOT_FOUND', '阅读项目不存在'); if (project.removedAt) fail('PROJECT_REMOVED', '仓库已从阅读列表移除，源码与原阅读档案仍保留'); return project; }
   repo(sessionId, repoId) { const project = this.project(this.session(sessionId).projectId); const repo = project.repositories.find(r => r.id === repoId); if (!repo) fail('REPO_NOT_BOUND', '此仓库未绑定到当前阅读项目'); return repo; }
   async lock(key, operation) {
     const previous = this.locks.get(key) ?? Promise.resolve();
     const next = previous.catch(() => {}).then(operation); this.locks.set(key, next);
     try { return await next; } finally { if (this.locks.get(key) === next) this.locks.delete(key); }
   }
-  async writable(directory) {
+  assertPersisted(id) { const state = this.session(id); if (state.draft) fail('SESSION_DRAFT', '请先确认发起阅读，再保存批注、归档或导出'); return state; }
+  assertUnarchived(id) { const state = this.session(id); if (state.archivedAt) fail('SESSION_ARCHIVED', '此阅读会话已归档，请先恢复后再继续阅读'); return state; }
+  async writable(directory, draftId) {
+    for (const state of this.sessions.values()) if (state.draft && !this.projects.get(state.projectId)?.removedAt && state.id !== draftId && contains(this.sessionDir(state.id), directory)) fail('SESSION_DRAFT', '未发起的阅读草稿不能写入档案');
     await checkBinding(this.storageBinding);
     for (const project of this.projects.values()) for (const repo of project.repositories) assertDisjoint(this.root, repo.root);
     if (!contains(this.root, directory)) fail('OUTPUT_DENIED', '产物路径超出固定阅读目录');
@@ -106,7 +117,7 @@ export class ReadingStore {
     if (mode !== undefined) readingModeSchema.parse(mode);
     if (intent !== undefined) promptIntentSchema.parse(intent);
     return this.lock(id, async () => {
-      guard?.(); const state = clone(this.session(id)); const next = mode ?? state.readingMode ?? 'question'; const nextIntent = intent ?? state.intent ?? 'explain';
+      guard?.(); const state = clone(this.assertUnarchived(id)); const next = mode ?? state.readingMode ?? 'question'; const nextIntent = intent ?? state.intent ?? 'explain';
       const nextFocus = focus === undefined ? state.readingFocus ?? null : parseReadingFocus(focus, this.project(state.projectId));
       const changedMode = state.readingMode !== next;
       if (!changedMode && state.intent === nextIntent && JSON.stringify(state.readingFocus ?? null) === JSON.stringify(nextFocus)) return next;
@@ -116,8 +127,26 @@ export class ReadingStore {
       await this.saveState(state, guard); return next;
     });
   }
-  async saveState(state, guard) { const dir = this.sessionDir(state.id); await this.writable(dir); guard?.(); await atomicText(path.join(dir, 'state.json'), json(state), undefined, guard); this.sessions.set(state.id, clone(state)); }
-  async audit(id, action, fields = {}) { const dir = this.sessionDir(id); await this.writable(dir); await appendAudit(path.join(dir, 'audit.jsonl'), { time: new Date().toISOString(), projectId: this.session(id).projectId, sessionId: id, action, ...fields }); }
+  async saveState(state, guard, promoting = false) {
+    if (this.session(state.id).draft && !state.draft && !promoting) fail('SESSION_DRAFT', '草稿只能由明确发起阅读操作持久化');
+    if (state.draft) { guard?.(); this.session(state.id); this.sessions.set(state.id, clone(state)); return; }
+    const dir = this.sessionDir(state.id); await this.writable(dir, promoting ? state.id : undefined); guard?.();
+    await atomicText(path.join(dir, 'state.json'), json(state), undefined, guard); this.sessions.set(state.id, clone(state));
+  }
+  async audit(id, action, fields = {}) {
+    // Draft browsing is ephemeral. Retain only bounded evidence-read metadata for promotion.
+    const state = this.session(id);
+    if (state.draft) {
+      if (action === 'read') { const rows = this.draftReadAudits.get(id) ?? new Map(); if (rows.size >= 500 && !rows.has(fields.evidenceId)) fail('EVIDENCE_LIMIT', '此阅读草稿的证据审计已达上限'); rows.set(fields.evidenceId, { time: new Date().toISOString(), ...clone(fields) }); this.draftReadAudits.set(id, rows); }
+      return;
+    }
+    const dir = this.sessionDir(id); await this.writable(dir); await appendAudit(path.join(dir, 'audit.jsonl'), { time: new Date().toISOString(), projectId: state.projectId, sessionId: id, action, ...fields });
+  }
+  async flushDraftReads(id, guard) {
+    const rows = this.draftReadAudits.get(id); if (!rows) return;
+    for (const [key, fields] of rows) { guard?.(); await this.audit(id, 'read', fields); rows.delete(key); }
+    if (!rows.size) this.draftReadAudits.delete(id);
+  }
   async createProject(raw) {
     const request = createProjectSchema.parse(raw);
     return this.lock('projects', async () => {
@@ -133,14 +162,88 @@ export class ReadingStore {
       this.projects.set(project.id, project); return clone(project);
     });
   }
-  async createSession(projectId) {
-    const project = this.project(projectId); for (const repo of project.repositories) await checkBinding(repo);
-    const state = { id: makeId('reading'), projectId, revision: 1, stage: 'discover', topic: '', readingMode: 'question', readingModeRevision: 0, intent: 'explain', readingFocus: null, readerState: readerStateSchema.parse({}), createdAt: new Date().toISOString(), evidence: [], lessons: [], messageRefs: [], archiveSeq: -1, stageHistory: [{ revision: 1, stage: 'discover', topic: '', time: new Date().toISOString() }], publishReceipts: {} };
-    this.sessions.set(state.id, state);
-    try { for (const dir of ['', 'notes', 'diagrams', 'messages', 'exports']) await this.writable(path.join(this.sessionDir(state.id), dir)); await this.saveState(state); await this.audit(state.id, 'session-created', { bindingRevision: project.bindingRevision }); return clone(state); } catch (error) { this.sessions.delete(state.id); throw error; }
+  async removeProject(raw, guard, busy = () => false) {
+    const args = z.object({ projectId: idSchema, expectedBindingRevision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER) }).strict().parse(raw);
+    return this.lock('projects', () => this.lock('sessions', async () => {
+      guard?.(); const project = this.projects.get(args.projectId);
+      if (!project) fail('PROJECT_NOT_FOUND', '阅读项目不存在');
+      if (project.bindingRevision !== args.expectedBindingRevision) fail('STALE_BINDING_REVISION', '仓库绑定已变化，请刷新后再移除');
+      const result = value => ({ projectId: value.id, removedAt: value.removedAt });
+      if (project.removedAt) return result(project);
+      const ids = [...this.sessions.values()].filter(state => state.projectId === project.id).map(state => state.id).sort();
+      const current = () => { guard?.(); if (ids.some(id => busy(id))) fail('AGENT_BUSY', '此仓库仍有阅读正在进行，请先停止或等待结束后再移除'); };
+      current();
+      // Serialize with session creation, prompt admission, and all in-flight store writes.
+      const keys = [...ids.map(id => `admission:${id}`), ...ids];
+      const locked = index => index === keys.length ? commit() : this.lock(keys[index], () => locked(index + 1));
+      const commit = async () => {
+        current(); const next = { ...clone(project), removedAt: new Date().toISOString() }; const dir = this.projectDir(project.id);
+        await this.writable(dir); current();
+        // Only the fixed metadata file changes. Source roots and archive directories are never deleted or moved.
+        await atomicText(path.join(dir, 'project.json'), json(next), undefined, current);
+        this.projects.set(project.id, next);
+        for (const id of ids) { this.draftReadAudits.delete(id); this.archiveErrors.delete(id); }
+        return result(next);
+      };
+      return locked(0);
+    }));
   }
-  list() { return { root: this.root, diagnostics: [...this.diagnostics], projects: [...this.projects.values()].map(p => ({ ...clone(p), sessions: [...this.sessions.values()].filter(s => s.projectId === p.id).map(s => ({ id: s.id, stage: s.stage, topic: s.topic, readingMode: s.readingMode ?? 'question', intent: s.intent ?? 'explain', createdAt: s.createdAt, revision: s.revision })) })) }; }
-  catalog(id) { const state = this.session(id); return { sessionId: id, project: clone(this.project(state.projectId)), stage: state.stage, topic: state.topic, revision: state.revision, readingMode: state.readingMode ?? 'question', readingModeRevision: state.readingModeRevision ?? 0, intent: state.intent ?? 'explain', readingFocus: clone(state.readingFocus ?? null), outputDirectory: this.sessionDir(id), limits: { fileBytes: 1048576, evidence: 500, lessons: 100 }, instructions: '每次显式指定 repoId。readingMode 是阅读起点，本轮明确意图优先；选区始终从 code 阅读开始。intent 仅标识本轮：logic-graph 必须围绕当前已核验选区生成有证据的逻辑图，explain 不强制绘图。代码归档 codeUnits 最少完整方法/函数，必要时完整类或整文件；先连续读取完整范围，保留 UTF16 start/end 排他坐标、哈希、结论和覆盖证据。本轮 readingFocus 若为代码须被单元完整包含，不可因 claims 漏写选区而跳过。语义边界由 AI 据语言识别，Host 只核验字节/坐标/证据覆盖，非通用 AST。明确文档/数据路径可豁免；未知扩展仍按代码。stage 仅保留兼容状态；五个维度按问题需要组合，没有固定顺序。discover 仅用于模糊宽泛目标，verify 仅用户明确要求时使用；发布一个知识点后等待用户。' }; }
+  async createSession(projectId, { draft = false, modelSelection = null, modelSelectionManaged = false } = {}, guard) {
+    z.boolean().parse(draft); z.boolean().parse(modelSelectionManaged);
+    if (modelSelectionManaged) modelSelection = modelRefSchema.parse(modelSelection);
+    return this.lock('sessions', async () => {
+      guard?.(); const project = this.project(projectId); for (const repo of project.repositories) { await checkBinding(repo); guard?.(); }
+      const drafts = [...this.sessions.values()].filter(state => state.draft);
+      if (draft && drafts.length >= 100) { const oldest = drafts[0].id; this.sessions.delete(oldest); this.draftReadAudits.delete(oldest); this.archiveErrors.delete(oldest); }
+      const state = { id: makeId('reading'), projectId, draft, archivedAt: null, archiveRevision: 0, ...(draft ? { draftModelSelection: clone(modelSelection) } : {}), ...(modelSelectionManaged ? { modelSelectionManaged: true, ...(!draft ? { nativePending: true, pendingNativeModel: clone(modelSelection) } : {}) } : {}), revision: 1, stage: 'discover', topic: '', readingMode: 'question', readingModeRevision: 0, intent: 'explain', readingFocus: null, readerState: readerStateSchema.parse({}), createdAt: new Date().toISOString(), evidence: [], lessons: [], messageRefs: [], archiveSeq: -1, stageHistory: [{ revision: 1, stage: 'discover', topic: '', time: new Date().toISOString() }], publishReceipts: {} };
+      guard?.(); this.sessions.set(state.id, state);
+      if (draft) return clone(state);
+      try { for (const dir of ['', 'notes', 'diagrams', 'messages', 'exports']) { guard?.(); await this.writable(path.join(this.sessionDir(state.id), dir)); } await this.saveState(state, guard); await this.audit(state.id, 'session-created', { bindingRevision: project.bindingRevision }); return clone(state); } catch (error) { this.sessions.delete(state.id); throw error; }
+    });
+  }
+  async persistDraft(id, guard) {
+    return this.lock(id, async () => {
+      guard?.(); const state = clone(this.assertUnarchived(id)); if (!state.draft) { await this.flushDraftReads(id, guard); return state; }
+      const project = this.project(state.projectId); for (const repo of project.repositories) { await checkBinding(repo); guard?.(); }
+      state.draft = false; state.nativePending = true; state.pendingNativeModel = clone(state.draftModelSelection); delete state.draftModelSelection;
+      for (const dir of ['', 'notes', 'diagrams', 'messages', 'exports']) { guard?.(); await this.writable(path.join(this.sessionDir(id), dir), id); }
+      await this.saveState(state, guard, true); await this.audit(id, 'session-created', { bindingRevision: project.bindingRevision }); await this.flushDraftReads(id, guard); return clone(state);
+    });
+  }
+  async completeNativeSession(id, guard) {
+    return this.lock(id, async () => { guard?.(); const state = clone(this.session(id)); if (!state.nativePending) return; delete state.nativePending; delete state.pendingNativeModel; await this.saveState(state, guard); });
+  }
+  async selectDraftModel(raw, guard) {
+    const args = modelSchema.parse(raw);
+    return this.lock(args.sessionId, async () => {
+      guard?.(); const state = clone(this.assertUnarchived(args.sessionId)); if (!state.draft && !state.nativePending) fail('SESSION_NOT_DRAFT', '此阅读会话已经发起');
+      state[state.draft ? 'draftModelSelection' : 'pendingNativeModel'] = { provider: args.provider, model: args.model };
+      await this.saveState(state, guard); return { selected: args };
+    });
+  }
+  async discardDraft(id, guard) {
+    idSchema.parse(id);
+    return this.lock(id, async () => {
+      guard?.(); const state = this.sessions.get(id); if (!state) return { sessionId: id, discarded: false };
+      if (!state.draft) fail('SESSION_NOT_DRAFT', '已发起的阅读会话不能作为草稿丢弃，请改为归档');
+      this.sessions.delete(id); this.archiveErrors.delete(id); this.draftReadAudits.delete(id); return { sessionId: id, discarded: true };
+    });
+  }
+  async setSessionArchived(raw, guard) {
+    const args = z.object({ sessionId: idSchema, archived: z.boolean(), expectedRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER) }).strict().parse(raw);
+    return this.lock(args.sessionId, async () => {
+      guard?.(); const state = clone(this.assertPersisted(args.sessionId));
+      const result = () => ({ sessionId: state.id, archivedAt: state.archivedAt ?? null, archiveRevision: state.archiveRevision ?? 0 });
+      if (!!state.archivedAt === args.archived) return result();
+      if ((state.archiveRevision ?? 0) !== args.expectedRevision) fail('STALE_ARCHIVE_REVISION', '阅读会话归档状态已变化，请刷新后重试');
+      if (state.archiveRevision >= Number.MAX_SAFE_INTEGER) fail('ARCHIVE_REVISION_LIMIT', '阅读会话归档版本已达上限');
+      state.archivedAt = args.archived ? new Date().toISOString() : null; state.archiveRevision = (state.archiveRevision ?? 0) + 1;
+      await this.audit(state.id, 'session-archive-attempt', { archived: args.archived, archiveRevision: state.archiveRevision });
+      await this.saveState(state, guard); return result();
+    });
+  }
+  list() { return { root: this.root, diagnostics: [...this.diagnostics], projects: [...this.projects.values()].filter(p => !p.removedAt).map(p => ({ ...clone(p), sessions: [...this.sessions.values()].filter(s => s.projectId === p.id && !s.draft).map(s => ({ id: s.id, draft: false, archivedAt: s.archivedAt ?? null, archiveRevision: s.archiveRevision ?? 0, stage: s.stage, topic: s.topic, readingMode: s.readingMode ?? 'question', intent: s.intent ?? 'explain', createdAt: s.createdAt, revision: s.revision })) })) }; }
+  catalog(id) { const state = this.session(id); return { sessionId: id, draft: !!state.draft, archivedAt: state.archivedAt ?? null, archiveRevision: state.archiveRevision ?? 0, project: clone(this.project(state.projectId)), stage: state.stage, topic: state.topic, revision: state.revision, readingMode: state.readingMode ?? 'question', readingModeRevision: state.readingModeRevision ?? 0, intent: state.intent ?? 'explain', readingFocus: clone(state.readingFocus ?? null), outputDirectory: this.sessionDir(id), limits: { fileBytes: 1048576, evidence: 500, lessons: 100 }, instructions: '每次显式指定 repoId。readingMode 是阅读起点，本轮明确意图优先；选区始终从 code 阅读开始。intent 仅标识本轮：logic-graph 必须围绕当前已核验选区生成有证据的逻辑图，explain 不强制绘图。代码归档 codeUnits 最少完整方法/函数，必要时完整类或整文件；先连续读取完整范围，保留 UTF16 start/end 排他坐标、哈希、结论和覆盖证据。本轮 readingFocus 若为代码须被单元完整包含，不可因 claims 漏写选区而跳过。语义边界由 AI 据语言识别，Host 只核验字节/坐标/证据覆盖，非通用 AST。明确文档/数据路径可豁免；未知扩展仍按代码。stage 仅保留兼容状态；五个维度按问题需要组合，没有固定顺序。discover 仅用于模糊宽泛目标，verify 仅用户明确要求时使用；发布一个知识点后等待用户。' }; }
   async read(id, raw, signal) {
     const args = readSchema.parse(raw);
     return this.lock(id, async () => {
@@ -199,7 +302,7 @@ export class ReadingStore {
   async publish(id, raw, receipt, turn) {
     const args = publishSchema.parse(raw); const mermaid = validateMermaid(args.mermaid);
     return this.lock(id, async () => {
-      const state = clone(this.session(id));
+      this.assertPersisted(id); const state = clone(this.assertUnarchived(id));
       // Empty additive defaults must not change old publication receipt bytes.
       const { sections, codeUnits, ...legacyPayload } = args;
       const payloadHash = digest(JSON.stringify({ ...legacyPayload, ...(sections.length ? { sections } : {}), ...(codeUnits.length ? { codeUnits } : {}) }));
@@ -255,18 +358,18 @@ export class ReadingStore {
       }
     });
   }
-  async changeStage(raw) {
+  async changeStage(raw, guard) {
     const args = changeStageSchema.parse(raw);
     return this.lock(args.sessionId, async () => {
-      const state = clone(this.session(args.sessionId)); if (state.revision !== args.expectedRevision) fail('STALE_REVISION', '阅读状态已变化，请刷新后重试');
+      guard?.(); const state = clone(this.assertUnarchived(args.sessionId)); if (state.revision !== args.expectedRevision) fail('STALE_REVISION', '阅读状态已变化，请刷新后重试');
       if (state.stageHistory.length >= 500) fail('STAGE_LIMIT', '阶段历史已达上限，请新建会话');
       state.revision++; state.stage = args.stage; state.topic = args.topic; state.stageHistory.push({ revision: state.revision, stage: state.stage, topic: state.topic, time: new Date().toISOString() });
-      await this.audit(state.id, 'human-stage-selected', { stage: state.stage, revision: state.revision, topicHash: digest(state.topic) }); await this.saveState(state); return this.catalog(state.id);
+      await this.audit(state.id, 'human-stage-selected', { stage: state.stage, revision: state.revision, topicHash: digest(state.topic) }); await this.saveState(state, guard); return this.catalog(state.id);
     });
   }
   async archiveEvents(id, events) {
     return this.lock(id, async () => {
-      const state = clone(this.session(id));
+      const state = clone(this.assertPersisted(id));
       if (events.some((event, index) => event.seq !== index)) fail('ARCHIVE_GAP', '归档必须重放从 0 开始的完整连续 DSH 事件前缀');
       for (const event of events) {
         if (event.seq <= state.archiveSeq) continue;
@@ -293,7 +396,7 @@ export class ReadingStore {
   }
   async exportSession(id) {
     return this.lock(id, async () => {
-      const state = this.session(id); const project = this.project(state.projectId);
+      const state = this.assertPersisted(id); const project = this.project(state.projectId);
       let text = `# ${project.title} — 阅读档案\n\n会话：${id}\n\n## 仓库绑定\n\n${project.repositories.map(r => `- ${r.name} (${r.id})：${r.root}`).join('\n')}\n\n## 阅读知识点\n\n${state.lessons.map(l => `### ${l.title}\n\n${l.markdown}${sectionMarkdown(l, 4)}${codeUnitsMarkdown(l, 4)}\n\n**核心结论**：${l.conclusion}\n${l.mermaid ? `\n\`\`\`mermaid\n${l.mermaid}\n\`\`\`\n` : ''}`).join('\n\n')}\n\n## 证据索引\n\n${state.evidence.map(e => `- ${e.id} · ${e.repoId}:${e.path}:${e.startLine}–${e.endLine} · SHA256 ${e.hash}`).join('\n')}\n\n> 历史证据对应读取时的版本，不是当前源码承诺。阅读调用未运行项目；多个仓库不是原子快照。\n`;
       text += annotationMarkdown((await loadAnnotations(this, id)).items);
       const dir = path.join(this.sessionDir(id), 'exports'); await this.writable(dir); const file = path.join(dir, 'reading.md'); await atomicText(file, text); await this.audit(id, 'exported'); return { path: file, markdown: text };

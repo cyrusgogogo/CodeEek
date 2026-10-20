@@ -15,6 +15,7 @@ const versionSchema = z.object({ operation: z.enum(['create', 'confirm', 'rebind
 const itemSchema = z.object({ id: annotationId, revision: z.number().int().min(1).max(20), body: z.string().min(1).max(4000), createdAt: z.string(), updatedAt: z.string(), needsReview: z.boolean(), observed: z.object({ time: z.string(), hash: hashSchema.nullable(), reason: z.string().max(100) }).strict().optional(), history: z.array(versionSchema).min(1).max(20) }).strict();
 const receiptSchema = z.object({ payloadHash: hashSchema, annotationId, revision: z.number().int().positive() }).strict();
 const manifestSchema = z.object({ format: z.literal(1), sessionId: idSchema, revision: z.number().int().min(0), items: z.array(itemSchema).max(100), receipts: z.record(z.string().uuid(), receiptSchema) }).strict();
+export const MAX_FILE_VIEW_LINES = 20000;
 const fileSchema = z.object({ sessionId: idSchema, repoId: idSchema, path: relativeSchema, offset: z.number().int().min(1).default(1), limit: z.number().int().min(1).max(400).default(200) }).strict();
 const createSchema = z.object({ sessionId: idSchema, requestId: z.string().uuid(), body: z.string().trim().min(1).max(4000), selection: selectionSchema }).strict();
 const updateSchema = z.object({ sessionId: idSchema, requestId: z.string().uuid(), annotationId, expectedRevision: z.number().int().positive(), operation: z.enum(['confirm', 'rebind']), expectedFileHash: hashSchema.optional(), selection: selectionSchema.optional() }).strict().refine(value => value.operation === 'confirm' ? !!value.expectedFileHash && !value.selection : !!value.selection && !value.expectedFileHash, { message: '确认需要当前哈希，重新绑定需要明确选区' });
@@ -62,15 +63,21 @@ export async function browseDirectory(store, raw, signal) {
 export async function viewFile(store, raw, signal, guard) {
   const args = fileSchema.parse(raw);
   return store.lock(args.sessionId, async () => {
-    signal?.throwIfAborted(); const repo = store.repo(args.sessionId, args.repoId); const data = await loadAnnotations(store, args.sessionId); let source;
+    guard?.(); signal?.throwIfAborted(); const repo = store.repo(args.sessionId, args.repoId); const data = await loadAnnotations(store, args.sessionId); let source;
     try { source = await readRepository(repo, args.path); } catch (error) { await observe(store, args.sessionId, data, args.repoId, args.path, null, error.code ?? 'UNREADABLE', guard); throw error; }
-    signal?.throwIfAborted(); await observe(store, args.sessionId, data, args.repoId, args.path, source, 'HASH_CHANGED', guard);
-    if (args.offset > source.lines.length) fail('LINE_RANGE', '起始行超出文件范围');
-    const lines = []; let chars = 0;
-    for (let index = args.offset - 1; index < Math.min(source.lines.length, args.offset - 1 + args.limit); index++) { if (chars + source.lines[index].length > LIMITS.excerptChars) { if (!lines.length) fail('EXCERPT_LIMIT', '这一行超过 100,000 字符，暂不支持打开'); break; } lines.push({ number: index + 1, text: source.lines[index] }); chars += source.lines[index].length + 1; }
+    guard?.(); signal?.throwIfAborted(); await observe(store, args.sessionId, data, args.repoId, args.path, source, 'HASH_CHANGED', guard);
+    // UI browsing is one complete checked file version, not an AI evidence excerpt.
+    // Legacy offset/limit inputs remain validated for old clients but never slice or
+    // stitch source. readRepository still owns the 1 MiB/UTF-8/identity boundary;
+    // ReadingStore.read retains its separate 400-line/100,000-character budget.
+    // A byte-bounded newline-only file can still create millions of DOM nodes.
+    // Reject that entire view explicitly instead of truncating or paginating it.
+    if (source.lines.length > MAX_FILE_VIEW_LINES) fail('FILE_VIEW_LINE_LIMIT', '完整文件超过工作台 20,000 行渲染上限；未打开任何部分，请选择较小文件。单文件仍限制为 1 MiB');
+    const lines = source.lines.map((text, index) => ({ number: index + 1, text }));
     signal?.throwIfAborted();
-    await store.audit(args.sessionId, 'file-view', { repoId: repo.id, path: args.path, hash: source.hash, startLine: args.offset, endLine: lines.at(-1)?.number, bytes: source.bytes });
-    return { repoId: repo.id, path: args.path, hash: source.hash, bytes: source.bytes, totalLines: source.lines.length, offset: args.offset, lines, codeReadings: collectCodeReadings(store, args.sessionId, repo.id, args.path, source), annotationRevision: data.revision, annotations: data.items.filter(item => head(item).repoId === repo.id && head(item).path === args.path).map(item => presented(item, source)) };
+    await store.audit(args.sessionId, 'file-view', { repoId: repo.id, path: args.path, hash: source.hash, startLine: 1, endLine: lines.length, bytes: source.bytes });
+    guard?.(); signal?.throwIfAborted();
+    return { repoId: repo.id, path: args.path, hash: source.hash, bytes: source.bytes, totalLines: source.lines.length, offset: 1, lines, codeReadings: collectCodeReadings(store, args.sessionId, repo.id, args.path, source), annotationRevision: data.revision, annotations: data.items.filter(item => head(item).repoId === repo.id && head(item).path === args.path).map(item => presented(item, source)) };
   });
 }
 export async function listAnnotations(store, raw) { const { sessionId } = z.object({ sessionId: idSchema }).strict().parse(raw); return store.lock(sessionId, async () => { const data = await loadAnnotations(store, sessionId); return { revision: data.revision, items: data.items.map(item => presented(item)) }; }); }
