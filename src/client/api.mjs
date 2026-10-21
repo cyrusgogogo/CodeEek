@@ -7,6 +7,7 @@ export function validateHostStatus(value) {
   if (typeof value.dataDirectory !== 'string' || !value.dataDirectory) throw protocolError(200);
   if (!Array.isArray(value.capabilities) || !value.capabilities.includes('remove-project')) throw new ReadingApiError('VERSION_MISMATCH', '阅读 Host 尚不支持仓库移除，可能仍运行同版本号的旧构建。请确认安装了包含删除功能的 Host，完整退出并重启 DSH，再刷新页面；仅刷新页面不会更新 Host');
   if (!value.capabilities.includes('default-model')) throw new ReadingApiError('VERSION_MISMATCH', '阅读 Host 尚不支持默认阅读模型设置。请确认安装了包含此功能的 Host，完整退出并重启 DSH，再刷新页面');
+  if (!value.capabilities.includes('structure-map-v1')) throw new ReadingApiError('VERSION_MISMATCH', '阅读 Host 尚不支持项目地图。请确认安装了包含结构索引功能的 Host，完整退出并重启 DSH，再刷新页面');
   return value;
 }
 
@@ -50,6 +51,7 @@ export async function api(method, params = {}, signal) {
     if (method === 'status' && result.error.code === 'UNKNOWN_METHOD') throw new ReadingApiError('VERSION_MISMATCH', '页面已更新，但阅读 Host 仍为旧版本。请完整退出并重启 DSH 后刷新页面', response.status);
     if (method === 'remove-project' && result.error.code === 'UNKNOWN_METHOD') throw new ReadingApiError('VERSION_MISMATCH', '阅读 Host 不支持仓库移除，本次删除未执行。请在插件管理确认安装了包含删除功能的 Host，完整退出并重启 DSH 后刷新页面；仅刷新页面不会更新 Host', response.status);
     if (['reading-settings', 'set-default-model'].includes(method) && result.error.code === 'UNKNOWN_METHOD') throw new ReadingApiError('VERSION_MISMATCH', `阅读 Host 不支持默认阅读模型设置${method === 'set-default-model' ? '，本次设置未保存' : ''}。请确认安装了包含此功能的 Host，完整退出并重启 DSH，再刷新页面`, response.status);
+    if (['structure-map', 'structure-map-refresh', 'structure-map-layers', 'structure-map-file'].includes(method) && result.error.code === 'UNKNOWN_METHOD') throw new ReadingApiError('VERSION_MISMATCH', '阅读 Host 尚不支持项目地图，本次地图操作未执行。请确认安装了包含结构索引功能的 Host，完整退出并重启 DSH，再刷新页面', response.status);
     throw new ReadingApiError(result.error.code.slice(0, 80), result.error.message.slice(0, 1200), response.status);
   }
   if (!response.ok || !Object.hasOwn(result, 'value')) throw protocolError(response.status);

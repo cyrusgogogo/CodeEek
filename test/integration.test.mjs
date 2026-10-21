@@ -71,7 +71,7 @@ test('Host 与 scoped preset 接线：只读模式、五个专用工具和私有
 test('安装状态只读返回同源版本与目录来源，不创建项目或请求模型', async t => {
   const f = await nativeFixture(t); const before = f.runtime.store.list(); const status = await f.runtime.dispatch('status', {});
   assert.equal(status.package, 'dsh-code-reading'); assert.equal(status.version, JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
-  assert.equal(status.apiVersion, 1); assert.deepEqual(status.capabilities, ['remove-project', 'default-model']); assert.equal(status.targetDshVersion, '0.2.1-rc.2'); assert.equal(status.dataDirectory, path.resolve(f.dataDir)); assert.equal(status.dataSource, 'config.dataDir');
+  assert.equal(status.apiVersion, 1); assert.deepEqual(status.capabilities, ['remove-project', 'default-model', 'structure-map-v1']); assert.equal(status.targetDshVersion, '0.2.1-rc.2'); assert.equal(status.dataDirectory, path.resolve(f.dataDir)); assert.equal(status.dataSource, 'config.dataDir');
   assert.deepEqual(f.runtime.store.list(), before); assert.equal(f.ctx.calls.length, 0);
 });
 test('不支持的请求类型也返回统一错误 envelope', async t => {
@@ -403,6 +403,30 @@ test('仓库移除端点只逻辑移除，旧页面与保留工具不能继续�
   for (const [method, params] of [['snapshot', { sessionId: f.sessionId }], ['view-file', { sessionId: f.sessionId, repoId: f.project.repositories[0].id, path: 'entry.ts' }], ['prompt', promptRequest(f)]]) await assert.rejects(f.runtime.dispatch(method, params), { code: 'PROJECT_REMOVED' });
   await assert.rejects(f.ctx.definitions.get('reading_catalog').execute({}, { agent }), { code: 'PROJECT_REMOVED' }); assert.ok(f.ctx.guards.some(check => check({ agent, name: 'write' })));
   assert.equal(f.ctx.live.get(f.sessionId), agent); assert.equal(f.ctx.calls.length, 0); assert.deepEqual(await fs.readFile(file), before); assert.deepEqual(await fs.readFile(path.join(f.repo, 'entry.ts')), source);
+});
+
+test('项目地图通过认证路由复用草稿绑定，索引和文件核验不生成阅读证据或模型请求', async t => {
+  const f = await nativeFixture(t); applyPreset(f.ctx); const { sessionId } = await f.runtime.dispatch('create-session', { projectId: f.project.id, draft: true });
+  const params = { sessionId, repoId: f.project.repositories[0].id }; const before = f.runtime.store.list();
+  const response = await f.ctx.route.fetch(new Request('http://localhost/api/code-reading', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ method: 'structure-map', params }) }));
+  assert.equal(response.status, 200); const envelope = await response.json(); assert.equal(envelope.ok, true); assert.equal(envelope.value.revision, 0); assert.equal(envelope.value.indexedAt, null); assert.deepEqual(envelope.value.files, []);
+  const indexed = await f.runtime.dispatch('structure-map-refresh', { ...params, expectedRevision: 0 });
+  assert.equal(indexed.revision, 1); assert.equal(indexed.projectId, f.project.id); assert.equal(indexed.repoId, params.repoId); assert.ok(indexed.files.some(file => file.path === 'entry.ts'));
+  const detail = await f.runtime.dispatch('structure-map-file', { ...params, path: 'entry.ts' });
+  assert.equal(detail.path, 'entry.ts'); assert.equal(detail.hash, digest(await fs.readFile(path.join(f.repo, 'entry.ts')))); assert.deepEqual(detail.codeReadings.items, []); assert.equal(Object.hasOwn(detail, 'lines'), false);
+  assert.equal(f.runtime.store.session(sessionId).draft, true); assert.equal(f.runtime.store.session(sessionId).evidence.length, 0); assert.deepEqual(f.runtime.store.list(), before); assert.equal(f.ctx.calls.length, 0);
+  assert.deepEqual([...f.ctx.definitions.keys()].sort(), ['reading_catalog', 'reading_files', 'reading_publish', 'reading_read', 'reading_search']);
+  const agent = f.ctx.live.get(f.sessionId); assert.ok(f.ctx.guards.some(check => check({ agent, name: 'structure-map-refresh' })), 'page operations never become Agent tools');
+  await assert.rejects(f.runtime.dispatch('structure-map-refresh', { ...params, expectedRevision: 0 }), { code: 'STALE_STRUCTURE_MAP' });
+  await assert.rejects(fs.stat(path.join(f.runtime.store.sessionDir(sessionId), 'state.json')), { code: 'ENOENT' });
+});
+
+test('项目地图写入等待期间停用 Host 不提交迟到索引，保留方法也拒绝执行', async t => {
+  const f = await nativeFixture(t); const params = { sessionId: f.sessionId, repoId: f.project.repositories[0].id }; const entered = deferred(); const release = deferred(); const original = f.runtime.store.writable.bind(f.runtime.store); let held = true;
+  f.runtime.store.writable = async (...args) => { if (held) { held = false; entered.resolve(); await release.promise; } return original(...args); };
+  const pending = f.runtime.dispatch('structure-map-refresh', { ...params, expectedRevision: 0 }); const rejected = assert.rejects(pending, { code: 'READING_UNAVAILABLE' }); await entered.promise; await f.ctx.dispose(); release.resolve(); await rejected;
+  for (const method of ['structure-map', 'structure-map-refresh', 'structure-map-layers', 'structure-map-file']) await assert.rejects(f.runtime.dispatch(method, params), { code: 'READING_UNAVAILABLE' });
+  await applyHost(f.ctx, { dataDir: f.dataDir }); assert.equal((await getRuntime(f.ctx.root).dispatch('structure-map', params)).revision, 0); assert.equal(f.ctx.calls.length, 0);
 });
 
 test('任一同项目会话运行中拒绝移除，prompt异步准入与移除串行不死锁', async t => {

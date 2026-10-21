@@ -12,13 +12,16 @@ import { FileWorkspace, FileRail, FileViewer, DocumentTabs } from './reader.jsx'
 import { topicTitle, ReadingRoute, LessonArticle, ReadingDialog, Transcript } from './workbench.jsx';
 import { UiIcon } from './icons/ui-icons.jsx';
 import { ModelSelect } from './model-select.jsx';
+import { StructureMap } from './structure-map.jsx';
+import { mapProjectKey, readerDocumentKind } from './structure-map-state.mjs';
+import structureMapCss from './structure-map.css';
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from './ui/select.jsx';
 import baseCss from './style.css';
 import workbenchCss from './workbench.css';
 import selectCss from './ui/select.css';
 import ideCss from './ide.css';
 import codeReadingsCss from './code-readings.css';
-const css = baseCss + '\n' + workbenchCss + '\n' + selectCss + '\n' + ideCss + '\n' + codeReadingsCss;
+const css = baseCss + '\n' + workbenchCss + '\n' + selectCss + '\n' + ideCss + '\n' + codeReadingsCss + '\n' + structureMapCss;
 
 export { renderDiagramDocument, api };
 export const inject = ['slots', 'uiWorkspace'];
@@ -76,12 +79,16 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   const activeRef = useRef(activeId); activeRef.current = activeId; const viewEpoch = useRef(0); const initializedView = useRef(null); const pendingOperations = useRef(0); const snapshotAbort = useRef(null); const setupAbort = useRef(null); const mounted = useRef(true); const waitingBaseline = useRef(-1); const pendingPrompt = useRef(null);
   const reader = useRef(null); const restorePending = useRef(null); const content = useRef(null); const readerStates = useRef(new Map()); const saveChains = useRef(new Map()); const consent = useRef(null); const navigation = useRef(0); const followResult = useRef(null); const lastAttempt = useRef(null); const submitting = useRef(null); const evidenceSequence = useRef(0); const listSequence = useRef(0); const cancelAcknowledged = useRef(false);
   const draftSessions = useRef(new Set()); const sessionFilters = useRef(null);
+  const [mapTabs, setMapTabs] = useState([]); const [mapReturn, setMapReturn] = useState('');
+  const mapViews = useRef(new Map()); const mapOrigins = useRef(new Map()); const nonMapPositions = useRef(new Map());
   const selectedLesson = snapshot?.state.lessons.find(lesson => lesson.id === selectedId) ?? null;
   const archived = !!snapshot?.archivedAt;
   const olderMessages = history.sessionId === activeId && history.epoch === viewEpoch.current ? history.rows : [];
   const ready = connection.state === 'ready' && listState === 'ready'; const running = !!snapshot?.running || waiting;
   const hasStarted = !!snapshot && (snapshot.state.lessons.length > 0 || snapshot.messages.length > 0 || !!snapshot.turnEnd || running);
   const currentProject = snapshot?.project ?? listing.projects.find(project => project.sessions.some(session => session.id === activeId));
+  const mapKey = mapProjectKey(currentProject); const mapIsOpen = mapTabs.includes(mapKey);
+  const mapAvailable = !!connection.status?.capabilities?.includes('structure-map-v1');
   const scope = snapshot ? JSON.stringify({ sessionId: activeId, model, bindingRevision: snapshot.project.bindingRevision, repos: snapshot.project.repositories.map(repo => [repo.id, repo.root]) }) : '';
   const requestedDocument = useRef(null);
   const handleController = useCallback(controller => { reader.current = controller; if (controller && restorePending.current) { controller.restorePosition(restorePending.current, { activate: false }); restorePending.current = null; } }, []);
@@ -102,12 +109,50 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
     if (window.matchMedia('(max-width:1100px)').matches) setRouteOpen(false);
     if (window.matchMedia('(max-width:900px)').matches) reader.current?.close();
   }
+  function mapNavigation() { navigation.current++; evidenceSequence.current++; followResult.current = null; }
+  function openMap() {
+    if (!snapshot || !ready || !mapAvailable) return;
+    if (activeDocument !== 'map') {
+      mapOrigins.current.set(mapKey, { sessionId: activeId, kind: activeDocument, position: reader.current?.capturePosition() ?? null, selectedId, stage: viewStage, scrollTop: content.current?.scrollTop ?? 0 });
+      void savePosition();
+    }
+    if (!mapViews.current.has(mapKey)) mapViews.current.set(mapKey, { projectId: snapshot.project.id });
+    const nextTabs = [...mapTabs.filter(key => key !== mapKey), mapKey].slice(-12); setMapTabs(nextTabs);
+    // Metadata-only navigation is bounded to twelve recently opened projects.
+    for (const key of mapViews.current.keys()) if (!nextTabs.includes(key)) { mapViews.current.delete(key); mapOrigins.current.delete(key); }
+    mapNavigation(); setCreating(false); setActiveDocument('map'); setMenuOpen(false);
+    const nav = navigation.current; const id = activeId;
+    requestAnimationFrame(() => { if (mounted.current && activeRef.current === id && navigation.current === nav) content.current?.closest('main')?.querySelector('.cr-document-tab-button[data-document-kind="map"]')?.focus({ preventScroll: true }); });
+    if (window.matchMedia('(max-width:1100px)').matches) setRouteOpen(false);
+    if (window.matchMedia('(max-width:900px)').matches) reader.current?.close();
+  }
+  function returnFromMap() {
+    mapNavigation(); const origin = mapOrigins.current.get(mapKey); const nav = navigation.current;
+    if (origin?.sessionId === activeId) {
+      if (origin.position) reader.current?.restorePosition(origin.position, { activate: false, focusViewer: origin.kind === 'source' });
+      setSelectedId(origin.selectedId); setViewStage(origin.stage); setActiveDocument(origin.kind === 'map' ? 'empty' : origin.kind);
+      requestAnimationFrame(() => {
+        if (!mounted.current || navigation.current !== nav || activeRef.current !== origin.sessionId) return;
+        if (content.current && origin.kind === 'reading') content.current.scrollTop = origin.scrollTop;
+        const main = content.current?.closest('main');
+        (origin.kind === 'source' ? main?.querySelector('.cr-file-viewer .cr-code-body') : origin.kind === 'reading' ? content.current?.querySelector('h1') : main?.querySelector('.cr-document-tabs'))?.focus({ preventScroll: true });
+      });
+    } else if (reader.current?.capturePosition()) reader.current.showSource();
+    else if (visibleReadingDocuments.some(item => item.sessionId === activeId)) openReading();
+    else setActiveDocument('empty');
+  }
+  function closeMap() {
+    if (activeDocument === 'map') returnFromMap();
+    setMapTabs(rows => rows.filter(key => key !== mapKey)); if (mapReturn === mapKey) setMapReturn('');
+  }
+  function openMapSource(location) { mapNavigation(); setMapReturn(mapKey); reader.current?.openLocation(location); }
+  function openMapReading(sessionId, lessonId) { mapNavigation(); setMapReturn(mapKey); openReading(sessionId, lessonId); }
   function closeReadingDocument(document) {
     setReadingDocuments(rows => rows.filter(row => row.sessionId !== document.sessionId));
     if (document.sessionId === activeId && draftSessions.current.has(document.sessionId)) { setDraft(''); setQuestionSelection(null); setConfirmation(null); setLastFailed(null); }
     if (document.sessionId !== activeId || activeDocument !== 'reading') return;
     const other = readingDocuments.filter(row => row.projectId === currentProject?.id && row.sessionId !== document.sessionId).at(-1);
-    if (reader.current?.capturePosition()) reader.current.showSource(); else if (other) openReading(other.sessionId); else setActiveDocument('empty');
+    if (reader.current?.capturePosition()) reader.current.showSource(); else if (other) openReading(other.sessionId); else if (mapIsOpen) openMap(); else setActiveDocument('empty');
   }
   const visibleReadingDocuments = readingDocuments.filter(document => document.projectId === currentProject?.id).map(document => ({ ...document, title: topicTitle(document.sessionId === snapshot?.sessionId ? snapshot.topic : currentProject?.sessions?.find(session => session.id === document.sessionId)?.topic, document.title) }));
 
@@ -199,12 +244,14 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   }
   function savePosition(announce = false) {
     if (!snapshot) return Promise.resolve();
-    const patch = { activeDocument: activeDocument === 'empty' ? null : activeDocument, viewStage, selectedLessonId: selectedId, viewedLessonIds: viewed, understoodLessonIds: understood, readerPosition: positionMetadata(reader.current?.capturePosition()), lessonScrollTop: content.current?.scrollTop ?? 0 };
-    return persistReading(patch).then(saved => { if (announce && saved && activeRef.current === snapshot.sessionId) setNotice('阅读位置已保存；仅保存位置元数据，不将源码或对话新增到浏览器存储。'); });
+    const previous = activeDocument === 'map' ? nonMapPositions.current.get(snapshot.sessionId) ?? readerStates.current.get(snapshot.sessionId) ?? emptyReaderState() : null;
+    const patch = previous ? { activeDocument: readerDocumentKind('map', previous.activeDocument), viewStage: previous.viewStage, selectedLessonId: previous.selectedLessonId, viewedLessonIds: previous.viewedLessonIds, understoodLessonIds: previous.understoodLessonIds, readerPosition: previous.readerPosition, lessonScrollTop: previous.lessonScrollTop } : { activeDocument: readerDocumentKind(activeDocument), viewStage, selectedLessonId: selectedId, viewedLessonIds: viewed, understoodLessonIds: understood, readerPosition: positionMetadata(reader.current?.capturePosition()), lessonScrollTop: content.current?.scrollTop ?? 0 };
+    if (activeDocument !== 'map') nonMapPositions.current.set(snapshot.sessionId, patch);
+    return persistReading(patch).then(saved => { if (announce && saved && activeRef.current === snapshot.sessionId) setNotice(activeDocument === 'map' ? '已保存原源码与阅读位置；项目地图位置仅在本页面保留，不新增浏览器内容存储。' : '阅读位置已保存；仅保存位置元数据，不将源码或对话新增到浏览器存储。'); });
   }
   function discardDraft(id) {
     if (!draftSessions.current.delete(id)) return;
-    readerStates.current.delete(id); saveChains.current.delete(id); if (mounted.current) setReadingDocuments(rows => rows.filter(row => row.sessionId !== id));
+    readerStates.current.delete(id); saveChains.current.delete(id); nonMapPositions.current.delete(id); if (mounted.current) setReadingDocuments(rows => rows.filter(row => row.sessionId !== id));
     // A prompt whose carrier result was lost may already have promoted this id.
     // The Host only discards memory drafts, never persisted reading archives.
     void api('discard-draft', { sessionId: id }).catch(() => {});
@@ -371,7 +418,10 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
     if (!mounted.current) return;
     const ids = new Set([...(project.sessions ?? []).map(session => session.id), ...(currentProject?.id === project.id ? [activeId] : [])]);
     const affected = ids.has(activeRef.current);
-    for (const id of ids) { draftSessions.current.delete(id); readerStates.current.delete(id); saveChains.current.delete(id); }
+    for (const id of ids) { draftSessions.current.delete(id); readerStates.current.delete(id); saveChains.current.delete(id); nonMapPositions.current.delete(id); }
+    const removedMapKeys = new Set([...mapViews.current].filter(([, memory]) => memory.projectId === project.id).map(([key]) => key));
+    for (const key of removedMapKeys) { mapViews.current.delete(key); mapOrigins.current.delete(key); }
+    setMapTabs(rows => rows.filter(key => !removedMapKeys.has(key))); if (removedMapKeys.has(mapReturn)) setMapReturn('');
     setReadingDocuments(rows => rows.filter(row => row.projectId !== project.id));
     setListing(previous => ({ ...previous, projects: previous.projects.filter(row => row.id !== project.id) }));
     if (affected) {
@@ -404,6 +454,7 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
       <span className="cr-badge cr-badge-safe">仓库只读</span>
       <div className="cr-project-menu"><button type="button" aria-label="阅读菜单" aria-expanded={menuOpen} aria-controls="cr-project-actions" onClick={() => setMenuOpen(value => !value)}>更多 <span aria-hidden="true">···</span></button>{menuOpen && <div id="cr-project-actions" className="cr-menu">
         <button type="button" disabled={busy || !ready} onClick={() => { setMenuOpen(false); newReading(); }}>新建阅读</button>
+        <button type="button" disabled={!snapshot || !ready || !mapAvailable} title={mapAvailable ? '查看项目结构，不会请求模型' : '当前 Host 尚不支持项目地图，请核对插件版本'} onClick={openMap}>项目地图</button>
         <button type="button" disabled={busy || !ready} onClick={() => { void savePosition(); setCreating(true); setMenuOpen(false); }}>打开其他仓库</button>
         <button type="button" onClick={() => { setDialog('settings'); setMenuOpen(false); }}>阅读设置</button>
         <button type="button" disabled={busy} onClick={() => { setMenuOpen(false); void perform(async () => { await loadSetup(); if (activeRef.current) await refresh(); }); }}>刷新</button>
@@ -415,7 +466,7 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
       <FileWorkspace key={currentProject?.id || 'empty'} sessionId={activeId} sessionDraft={!!snapshot?.draft} onMutation={async id => { try { if (activeRef.current === id) await refresh(id); await refreshList(); } catch (e) { if (activeRef.current === id) setNotice(`批注已保存，会话状态尚未刷新：${e.message}`); } }} repositories={snapshot?.project.repositories ?? []} repoId={repoId} onRepoChange={setRepoId} enabled={!!(ready && snapshot && !creating)} activeDocument={activeDocument} onOpen={() => { evidenceSequence.current++; navigation.current++; setActiveDocument('source'); void persistReading({ activeDocument: 'source' }); }} onController={handleController} onContextSelection={selection => { attachSelection(selection); setEntryMode('code'); }} analyzeDisabled={archived ? '请先恢复已归档的阅读会话' : busy || running ? '请等待本轮结束或停止后分析' : !model ? '请先选择本会话模型' : ''} onAnalyze={selection => analyzeSelection(selection)} onGraph={selection => analyzeSelection(selection, 'logic-graph')} onReading={openReading}>
         <FileRail />
         <main className="cr-content cr-reading-main cr-editor-main" aria-label="文档工作区">
-          {snapshot && !creating && <DocumentTabs activeDocument={activeDocument} readingDocuments={visibleReadingDocuments} activeSessionId={activeId} onReading={document => openReading(document.sessionId)} onCloseReading={closeReadingDocument} onEmpty={() => { const document = visibleReadingDocuments.at(-1); if (document) openReading(document.sessionId); else setActiveDocument('empty'); }} />}
+          {snapshot && !creating && <DocumentTabs activeDocument={activeDocument} readingDocuments={visibleReadingDocuments} activeSessionId={activeId} onReading={document => openReading(document.sessionId)} onCloseReading={closeReadingDocument} mapOpen={mapIsOpen} onMap={openMap} onCloseMap={closeMap} onEmpty={() => { const document = visibleReadingDocuments.at(-1); if (document) openReading(document.sessionId); else if (mapIsOpen) openMap(); else setActiveDocument('empty'); }} />}
           <div className="cr-editor-notices">
             {snapshot && connection.state === 'error' && <div className="cr-banner cr-error" role="alert">{connection.error?.message}<button type="button" disabled={busy} onClick={() => void perform(loadSetup)}>重试连接与加载</button></div>}
             {error && error !== connection.error?.message && <div className="cr-banner cr-error" role="alert">{error}{snapshot && <button type="button" disabled={busy} onClick={() => void perform(() => refresh())}>刷新核对状态</button>}</div>}
@@ -426,6 +477,8 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
             {snapshot && snapshotState === 'error' && <div className="cr-banner cr-error" role="alert">状态刷新失败，已完成内容保留。运行是否结束尚未确认。<button type="button" disabled={busy} onClick={() => void perform(() => refresh())}>重新加载档案</button></div>}
             {running && snapshot && <section className="cr-editor-task" role="status"><span className="cr-indeterminate" aria-hidden="true" /><span>{cancelPending ? '停止请求已提交，等待后端结束' : accepting ? '等待后端接纳本轮问题' : '正在分析本轮问题'}<small>代码与已有阅读内容仍可浏览</small></span><button type="button" disabled={cancelPending} onClick={() => void perform(stopAnalysis)}>{cancelPending ? '等待停止确认' : '停止分析'}</button></section>}
           </div>
+          {snapshot && !creating && mapIsOpen && mapReturn === mapKey && activeDocument !== 'map' && <div className="cr-map-return"><span>项目地图位置已保留</span><button type="button" onClick={openMap}>返回项目地图</button></div>}
+          {snapshot && !creating && mapIsOpen && mapViews.current.has(mapKey) && <StructureMap key={mapKey} project={snapshot.project} sessionId={activeId} enabled={ready && mapAvailable} active={activeDocument === 'map'} memory={mapViews.current.get(mapKey)} onNavigate={mapNavigation} onOpenSource={openMapSource} onOpenReading={openMapReading} onReturnDocument={returnFromMap} />}
           <div className="cr-editor-source cr-source-document" hidden={!snapshot || creating || activeDocument !== 'source'}><FileViewer /></div>
           {snapshot && !creating && activeDocument === 'empty' && <section className="cr-editor-empty" aria-label="代码工作区空态"><span className="cr-editor-empty-symbol"><UiIcon name="file-code-2" size={38} /></span><h1>选择文件，开始阅读</h1></section>}
           <div className="cr-reading-scroll" ref={content} hidden={!!(snapshot && !creating && activeDocument !== 'reading')}>
@@ -463,7 +516,7 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
             <div className="cr-composer-actions"><div className="cr-model-compact">{modelPicker}<button type="button" aria-label="阅读设置" onClick={() => setDialog('settings')}>设置</button></div>{!running && <button className="cr-primary" type="button" disabled={busy || !model || snapshotState === 'error'} onClick={() => requestPrompt(followText)}>{draft.trim() ? '发送问题' : '继续阅读'}<UiIcon name="chevron-right" size={14} /></button>}</div>
             <p id="cr-model-hint" className="cr-sr-only">{modelHint}</p><p id="cr-privacy" className="cr-sr-only">源码与问题可能发送至所选提供方配置的服务端点，首次调用或范围变化需确认。</p>{lastFailed && !running && <button type="button" className="cr-retry" disabled={busy} onClick={() => requestPrompt(lastFailed.text, lastFailed.selection, lastFailed.initial, lastFailed.stage, lastFailed)}>重试本次分析</button>}
           </section>}
-          {snapshot && !creating && (activeDocument !== 'reading' || snapshot.draft) && <footer className="cr-editor-statusbar" aria-label="阅读状态栏">{activeDocument !== 'reading' && <><span className="cr-editor-readonly"><UiIcon name="shield-check" size={13} />只读</span><div className="cr-editor-model">{modelPicker}</div></>}{snapshot.draft && <span className="cr-draft-notice" role="status">临时阅读，开始前不会保存到阅读列表。关闭或离开不会留下空记录；确认发起分析或保存人工批注时才保留。</span>}{activeDocument !== 'reading' && <><button type="button" className="cr-text-button" onClick={() => setDialog('settings')}>阅读设置</button><button type="button" className="cr-text-button" onClick={() => openReading()}>问题阅读</button></>}</footer>}
+          {snapshot && !creating && (activeDocument !== 'reading' || snapshot.draft) && <footer className="cr-editor-statusbar" aria-label="阅读状态栏">{activeDocument !== 'reading' && activeDocument !== 'map' && <><span className="cr-editor-readonly"><UiIcon name="shield-check" size={13} />只读</span><div className="cr-editor-model">{modelPicker}</div></>}{snapshot.draft && <span className="cr-draft-notice" role="status">临时阅读，开始前不会保存到阅读列表。关闭或离开不会留下空记录；确认发起分析或保存人工批注时才保留。</span>}{activeDocument !== 'reading' && <>{!mapIsOpen && <button type="button" className="cr-text-button" disabled={!ready || !mapAvailable} onClick={openMap}>项目地图</button>}<button type="button" className="cr-text-button" onClick={() => setDialog('settings')}>阅读设置</button><button type="button" className="cr-text-button" onClick={() => openReading()}>问题阅读</button></>}</footer>}
         </main>
       <aside className="cr-projects cr-route cr-reading-sidebar" aria-label="阅读列表">
         <div className="cr-route-toolbar"><strong>阅读列表</strong><button type="button" aria-label={routeOpen ? '收起列表' : '展开列表'} title={routeOpen ? '收起列表' : '展开列表'} aria-expanded={routeOpen} onClick={() => setRouteOpen(value => !value)}><UiIcon name={routeOpen ? 'chevron-right' : 'chevron-left'} /></button></div>

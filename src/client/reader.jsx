@@ -6,6 +6,7 @@ import { CodeBlock } from './code.jsx';
 import { readCodeSelection } from './selection.mjs';
 import { mergeAnnotations } from './annotation-state.mjs';
 import { ANNOTATION_LABELS } from '../anchors.mjs';
+import { mapPath } from './structure-map-state.mjs';
 
 const ReaderContext = createContext(null);
 const MAX_OPEN_FILES = 12;
@@ -48,6 +49,7 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
       if (!valid(seq, controller)) return;
       if (value.repoId !== target.repoId || value.path !== target.path || value.offset !== 1 || !/^[a-f\d]{64}$/.test(value.hash ?? '') || !Number.isSafeInteger(value.bytes) || value.bytes < 0 || value.bytes > 1048576 || !Number.isSafeInteger(value.totalLines) || value.totalLines < 1 || value.totalLines > MAX_FILE_VIEW_LINES || !Array.isArray(value.lines) || value.lines.length !== value.totalLines || value.lines.length > value.bytes + 1 || value.lines.some((row, index) => row?.number !== index + 1 || typeof row.text !== 'string' || /[\r\n]/.test(row.text)) || value.lines.reduce((chars, row) => chars + row.text.length + 1, -1) > value.bytes) throw new Error('源码响应不是同一版本的完整文件，请重新加载；不会拼接分页');
       if (target.focusLine > value.totalLines) setTarget(previous => sameFile(previous, target) ? { ...previous, unavailableOffset: target.focusLine } : previous);
+      if (target.locationKind === 'map' && target.expectedHash && target.expectedHash !== value.hash) pendingScroll.current = { repoId: target.repoId, path: target.path, offset: 1, ...emptyViewport(), focusViewer: true };
       setDocument(value); setLoadState('ready');
     }).catch(e => {
       if (!valid(seq, controller)) return;
@@ -77,7 +79,7 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     });
     return () => cancelAnimationFrame(frame);
   }, [visibleDocument, activeDocument]);
-  useEffect(() => { const pending = queuedRestore.current; if (enabled && pending?.sessionId === sessionId) { queuedRestore.current = null; restorePosition(pending.position, { activate: pending.activate }); } }, [enabled, sessionId, repositories]);
+  useEffect(() => { const pending = queuedRestore.current; if (enabled && pending?.sessionId === sessionId) { queuedRestore.current = null; restorePosition(pending.position, { activate: pending.activate, focusViewer: pending.focusViewer }); } }, [enabled, sessionId, repositories]);
   function showSource(nextTarget = current.current.target) {
     onOpen?.(nextTarget);
     if (window.matchMedia('(max-width:900px)').matches) setExpanded(false);
@@ -126,6 +128,12 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     if (typeof path !== 'string' || !path || !Number.isSafeInteger(Number(line)) || Number(line) < 1) return false;
     return openTarget({ repoId: fileRepo, path, offset: 1, focusLine: Number(line) }, Number(line) > 1 ? { focusLine: Number(line) } : {});
   }
+  function openLocation(location) {
+    if (!location || !mapPath(location.path) || !repositories.some(repo => repo.id === location.repoId) || !Number.isSafeInteger(location.line ?? 1) || (location.line ?? 1) < 1 || (location.expectedHash !== undefined && !/^[a-f0-9]{64}$/.test(location.expectedHash)) || (location.line > 1 && !location.expectedHash)) { setError('地图定位无效或缺少可核验的源码版本'); return false; }
+    const line = location.line ?? 1;
+    // Index navigation is not evidence and never creates a browser Selection.
+    return openTarget({ repoId: location.repoId, path: location.path, offset: 1, focusLine: line, expectedHash: location.expectedHash, locationKind: 'map' }, { focusLine: line, focusViewer: true });
+  }
   function openEvidence(source) {
     const evidence = source?.evidence;
     if (!evidence || (evidence.sessionId && evidence.sessionId !== sessionId) || typeof evidence.path !== 'string' || !/^[a-f\d]{64}$/i.test(evidence.hash ?? '') || !Number.isSafeInteger(evidence.startLine) || !Number.isSafeInteger(evidence.endLine) || evidence.startLine < 1 || evidence.endLine < evidence.startLine || !repositories.some(repo => repo.id === evidence.repoId)) { setError('证据位置无效或不属于当前阅读会话'); return false; }
@@ -144,10 +152,10 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     const position = { repoId: now.target.repoId, path: now.target.path, hash: matching ? now.document.hash : now.target.expectedHash ?? null, offset: 1, ...lastScroll.current, rail: now.rail, expanded: now.expanded, maximized: now.maximized, width: now.width, ...(now.target.evidence ? { evidence: { ...now.target.evidence } } : {}) };
     rememberPosition(position); return position;
   }
-  function restorePosition(position, { activate = true } = {}) {
+  function restorePosition(position, { activate = true, focusViewer = false } = {}) {
     if (!position || typeof position.repoId !== 'string' || typeof position.path !== 'string' || !position.path || !Number.isSafeInteger(position.offset) || position.offset < 1 || (position.hash != null && !/^[a-f\d]{64}$/i.test(position.hash))) return false;
-    if (!enabled) { queuedRestore.current = { sessionId, position: structuredClone(position), activate }; return true; }
-    const viewport = {}; for (const key of ['scrollTop', 'scrollLeft', 'panelScrollTop']) viewport[key] = Number.isFinite(position[key]) && position[key] >= 0 ? position[key] : 0;
+    if (!enabled) { queuedRestore.current = { sessionId, position: structuredClone(position), activate, focusViewer }; return true; }
+    const viewport = { focusViewer }; for (const key of ['scrollTop', 'scrollLeft', 'panelScrollTop']) viewport[key] = Number.isFinite(position[key]) && position[key] >= 0 ? position[key] : 0;
     const evidence = position.evidence?.sessionId === sessionId && position.evidence.repoId === position.repoId && position.evidence.path === position.path ? { ...position.evidence } : undefined;
     // Old archives stored a page start plus a page-relative scroll offset.
     // Restore that metadata as an anchor in the newly checked complete file.
@@ -158,8 +166,8 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
     setMaximized(position.maximized === true); if (Number.isFinite(position.width)) setWidth(Math.max(200, Math.min(420, position.width))); return true;
   }
   function reloadFile() { const saved = capturePosition(); if (saved) pendingScroll.current = positionOnly(saved); setSelected(null); setNonce(value => value + 1); }
-  const controller = useMemo(() => Object.fromEntries(['openEvidence', 'capturePosition', 'restorePosition', 'browseFiles', 'showSource', 'openFile', 'close', 'activateFile', 'closeFile'].map(name => [name, (...args) => methods.current[name](...args)])), []);
-  methods.current = { openEvidence, capturePosition, restorePosition, browseFiles, showSource, openFile, close, activateFile, closeFile };
+  const controller = useMemo(() => Object.fromEntries(['openEvidence', 'capturePosition', 'restorePosition', 'browseFiles', 'showSource', 'openFile', 'openLocation', 'close', 'activateFile', 'closeFile'].map(name => [name, (...args) => methods.current[name](...args)])), []);
+  methods.current = { openEvidence, capturePosition, restorePosition, browseFiles, showSource, openFile, openLocation, close, activateFile, closeFile };
   useEffect(() => { const callback = controllerCallback.current; callback?.(controller); return () => callback?.(null); }, [controller]);
   const notes = useMemo(() => mergeAnnotations(currentSession ? allNotes : [], visibleDocument, currentSession ? noteRevision : 0), [allNotes, visibleDocument, noteRevision, currentSession]);
   async function mutate(method, params) {
@@ -178,10 +186,10 @@ export function FileWorkspace({ sessionId, repositories, repoId, onRepoChange, e
   const value = { enabled, sessionId, sessionDraft, repositories, repoId, onRepoChange, activeDocument, target: visibleTarget, document: visibleDocument, loadState: currentSession ? loadState : 'idle', error: currentSession ? error : '', setError, selected: currentSession ? selected : null, setSelected, draft: currentSession ? draft : null, setDraft, activeNote: currentSession ? activeNote : '', setActiveNote, rail, setRail, expanded, setExpanded, maximized, setMaximized, width, setWidth, mutating, notes, openFiles, activateFile, closeFile, openFile, reloadFile, reloadNotes, annotate, reveal, mutate, onAnalyze, onGraph, onReading, analyzeDisabled, pinContext, browseFiles, showSource, viewerNodes, rememberViewport };
   return <ReaderContext.Provider value={value}>{children}</ReaderContext.Provider>;
 }
-export function DocumentTabs({ activeDocument, readingDocuments = [], activeSessionId, onReading, onCloseReading, onEmpty }) {
+export function DocumentTabs({ activeDocument, readingDocuments = [], activeSessionId, onReading, onCloseReading, onEmpty, mapOpen = false, onMap, onCloseMap }) {
   const r = useContext(ReaderContext); const nav = useRef(null); const activeReadingTitle = readingDocuments.find(document => document.sessionId === activeSessionId)?.title;
   function revealActive() { nav.current?.querySelector('.cr-document-tab[data-active="true"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }
-  useEffect(revealActive, [activeDocument, activeSessionId, activeReadingTitle, r.target?.repoId, r.target?.path, r.openFiles.length, readingDocuments.length]);
+  useEffect(revealActive, [activeDocument, activeSessionId, activeReadingTitle, r.target?.repoId, r.target?.path, r.openFiles.length, readingDocuments.length, mapOpen]);
   useEffect(() => { if (!nav.current || typeof ResizeObserver === 'undefined') return; const observer = new ResizeObserver(revealActive); observer.observe(nav.current); return () => observer.disconnect(); }, []);
   function navigate(event) {
     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
@@ -204,6 +212,10 @@ export function DocumentTabs({ activeDocument, readingDocuments = [], activeSess
       <button type="button" className="cr-document-tab-button" data-document-kind="reading" title={doc.title} aria-pressed={activeDocument === 'reading' && doc.sessionId === activeSessionId} onClick={() => onReading?.(doc)}><svg className="cr-document-book-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><path d="M12 5c-3-2-7-2-10-1v15c3-1 7-1 10 1m0-15c3-2 7-2 10-1v15c-3-1-7-1-10 1V5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" /></svg><span>{doc.title}</span></button>
       <button type="button" className="cr-document-tab-close" aria-label={`关闭阅读 ${doc.title}`} title={`关闭阅读 ${doc.title}`} onClick={() => { onCloseReading?.(doc); refocus(r.openFiles.length + index); }}><span aria-hidden="true">×</span></button>
     </div>)}
+    {mapOpen && <div className="cr-document-tab" data-active={activeDocument === 'map' ? 'true' : 'false'}>
+      <button type="button" className="cr-document-tab-button" data-document-kind="map" aria-pressed={activeDocument === 'map'} disabled={!r.enabled} onClick={onMap}><UiIcon name="folder-tree" size={16} /><span>项目地图</span></button>
+      <button type="button" className="cr-document-tab-close" aria-label="关闭项目地图" title="关闭项目地图" onClick={() => { onCloseMap?.(); refocus(r.openFiles.length + readingDocuments.length); }}><span aria-hidden="true">×</span></button>
+    </div>}
   </nav>;
 }
 function Directory({ path = '', label = '仓库根目录', repoId, rootPath = '', depth = 0, collapseVersion = 0 }) {
@@ -377,7 +389,7 @@ export function FileViewer({ embedded = false }) {
   return <section ref={frame} className={`cr-file-viewer${embedded ? ' cr-file-viewer-embedded' : ''}`} aria-label="文件阅读器" data-focus={r.maximized && r.activeDocument === 'source' ? 'true' : 'false'} tabIndex={-1} data-file-path={r.target.path} data-repo-id={r.target.repoId} data-source-status={stale ? 'stale' : doc ? 'current' : r.loadState} onScrollCapture={() => r.rememberViewport(frame.current)} onKeyDown={event => { if (!event.defaultPrevented && event.key === 'Escape' && r.maximized && !menu) { event.preventDefault(); r.setMaximized(false); } }}>
     <div className="cr-file-heading"><div className="cr-file-identity"><EntryIcon path={r.target.path} /><div><h3 title={filename}>{filename}</h3><p className="cr-file-parent" title={`${repo?.name ?? r.target.repoId} / ${parentPath}`}>{repo?.name ?? r.target.repoId} / {parentPath}</p></div></div><div className="cr-file-heading-actions"><span className="cr-file-status"><UiIcon name="shield-check" size={14} />只读</span><button type="button" disabled={r.loadState === 'loading'} onClick={r.reloadFile} aria-label="重新加载文件"><UiIcon name="refresh-cw" size={14} />重载</button><button type="button" aria-label={r.maximized ? '还原代码区域' : '最大化代码区域'} aria-pressed={r.maximized} title={r.maximized ? '还原代码区域（Esc）' : '最大化代码区域'} onClick={() => r.setMaximized(value => !value)}>{r.maximized ? '还原' : '最大化'}</button></div></div>
     {evidence && <section className="cr-source-evidence" aria-label="证据定位" data-evidence-id={evidence.id}><strong>{stale ? '历史证据 · 已失效' : doc ? '已核验的源码证据' : '正在核验证据版本'}</strong><span>证据范围 {evidence.startLine}–{evidence.endLine} 行</span><span>{evidence.symbol ? `符号线索：${evidence.symbol}` : '未指定符号线索'} · 文本线索，非 AST 结论</span><span className="cr-path" title={`取证时 SHA256：${evidence.hash}`}>取证版本 SHA256 {evidence.hash.slice(0, 12)}…</span></section>}
-    {stale && <p className="cr-banner cr-source-stale" role="alert">{evidence ? '此证据已失效：源码版本变化或无法核验。旧行号不再代表有效引用；下方若可读取，仅为当前源码对照，不高亮为已核验证据。' : '保存的阅读位置属于旧版本：当前源码 SHA256 已变化。保留原行号仅供对照，请重新确认位置。'}{r.target.unavailableOffset && <span> 原第 {r.target.unavailableOffset} 行已超出当前文件，已从第 1 行打开供对照。</span>}{evidence?.reason && <span> 原因：{evidence.reason}</span>}{hashMismatch && <span className="cr-path">原版本 SHA256：{r.target.expectedHash}</span>}</p>}
+    {stale && <p className="cr-banner cr-source-stale" role="alert">{evidence ? '此证据已失效：源码版本变化或无法核验。旧行号不再代表有效引用；下方若可读取，仅为当前源码对照，不高亮为已核验证据。' : r.target.locationKind === 'map' ? '项目地图定位已过期：当前源码 SHA256 与核验时不同。旧范围不再定位，已从文件开头打开供对照；请返回地图重新核验。此定位不是代码证据。' : '保存的阅读位置属于旧版本：当前源码 SHA256 已变化。保留原行号仅供对照，请重新确认位置。'}{r.target.unavailableOffset && <span> 原第 {r.target.unavailableOffset} 行已超出当前文件，已从第 1 行打开供对照。</span>}{evidence?.reason && <span> 原因：{evidence.reason}</span>}{hashMismatch && <span className="cr-path">原版本 SHA256：{r.target.expectedHash}</span>}</p>}
     {r.loadState === 'loading' && <p role="status">正在读取真实源码…</p>}
     {r.loadState === 'error' && <p className="cr-banner cr-error" role="alert">{r.error}<br />仅支持普通 UTF-8 文本／代码；不执行 HTML、脚本，不预览二进制文件。历史批注仍可在“批注”查看。</p>}
     {r.error && r.loadState !== 'error' && <p className="cr-banner cr-error" role="alert">{r.error}</p>}

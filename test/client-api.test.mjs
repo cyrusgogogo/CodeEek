@@ -69,19 +69,31 @@ test('旧 Host 不支持状态方法时明确提示完整重启', async t => {
   await assert.rejects(api('status'), error => error.code === 'VERSION_MISMATCH' && /完整退出/.test(error.message));
 });
 test('就绪判断要求包版本、接口、目标和启用状态全部一致', () => {
-  const healthy = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root', capabilities: ['remove-project', 'default-model'] };
+  const healthy = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root', capabilities: ['remove-project', 'default-model', 'structure-map-v1'] };
   assert.equal(validateHostStatus(healthy), healthy);
   for (const wrong of [null, { ...healthy, version: '0.1.1' }, { ...healthy, apiVersion: 999 }, { ...healthy, enabled: false }, { ...healthy, targetDshVersion: 'unknown' }]) assert.throws(() => validateHostStatus(wrong), { code: 'VERSION_MISMATCH' });
 });
 test('同版本旧 Host 没有仓库移除能力也不能通过就绪检查', () => {
   const old = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root' };
   for (const capabilities of [undefined, null, [], 'remove-project', ['other-feature']]) assert.throws(() => validateHostStatus({ ...old, capabilities }), error => error.code === 'VERSION_MISMATCH' && /仓库移除/.test(error.message) && /完整退出/.test(error.message));
-  assert.doesNotThrow(() => validateHostStatus({ ...old, capabilities: ['remove-project', 'default-model', 'future-feature'] }));
+  assert.doesNotThrow(() => validateHostStatus({ ...old, capabilities: ['remove-project', 'default-model', 'structure-map-v1', 'future-feature'] }));
 });
 test('同版本旧 Host 缺少默认模型能力不能开放新页面操作', () => {
   const old = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root', capabilities: ['remove-project'] };
   assert.throws(() => validateHostStatus(old), error => error.code === 'VERSION_MISMATCH' && /默认阅读模型/.test(error.message) && /完整退出/.test(error.message));
 });
+test('同版本旧 Host 缺少项目地图能力时要求重启新构建', () => {
+  const old = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root', capabilities: ['remove-project', 'default-model'] };
+  assert.throws(() => validateHostStatus(old), error => error.code === 'VERSION_MISMATCH' && /项目地图/.test(error.message) && /完整退出/.test(error.message));
+});
+for (const method of ['structure-map', 'structure-map-refresh', 'structure-map-layers', 'structure-map-file']) {
+  test(`${method} 的旧 Host 失败有明确恢复说明且不自动重发`, async t => {
+    let calls = 0; transport(t, async () => { calls++; return Response.json({ ok: false, error: { code: 'UNKNOWN_METHOD', message: '旧 Host' } }, { status: 400 }); });
+    await assert.rejects(api(method, {}), error => error.code === 'VERSION_MISMATCH' && /地图操作未执行/.test(error.message));
+    assert.equal(calls, 1);
+  });
+}
+
 test('旧 Host 不支持默认模型设置时明确指出未保存，且不自动重发', async t => {
   let calls = 0; transport(t, async () => { calls++; return Response.json({ ok: false, error: { code: 'UNKNOWN_METHOD', message: '不支持此阅读页面操作' } }, { status: 400 }); });
   await assert.rejects(api('reading-settings'), error => error.code === 'VERSION_MISMATCH' && /默认阅读模型/.test(error.message));

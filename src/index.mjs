@@ -9,6 +9,7 @@ import { checkBinding, readRepository } from './filesystem.mjs';
 import { canonicalSelection } from './anchors.mjs';
 import { browseDirectory, viewFile, listAnnotations, createAnnotation, updateAnnotation, selectionPrompt } from './workspace.mjs';
 import { readReadingSettings, setDefaultModel, modelRefSchema } from './preferences.mjs';
+import { getStructureMap, refreshStructureMap, updateStructureLayers, inspectStructureFile } from './structure-map.mjs';
 
 export const name = 'code-reading';
 export const inject = ['agentPresets', 'tools', 'systemPrompt', 'connection', 'sessionController', 'skills', 'agents'];
@@ -166,7 +167,7 @@ export async function apply(ctx, rawConfig = {}) {
     switch (method) {
       case 'status': {
         requireObject(params, []);
-        return { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, capabilities: ['remove-project', 'default-model'], dataDirectory: store.root, dataSource, tools: [...TOOL_NAMES] };
+        return { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, capabilities: ['remove-project', 'default-model', 'structure-map-v1'], dataDirectory: store.root, dataSource, tools: [...TOOL_NAMES] };
       }
       case 'reading-settings': requireObject(params, []); return readReadingSettings(store, () => assertActive(signal));
       case 'set-default-model': return setDefaultModel(store, params, () => assertActive(signal), selected => availableReadingModel(selected, () => assertActive(signal)));
@@ -278,6 +279,10 @@ export async function apply(ctx, rawConfig = {}) {
         return result;
       }
       case 'reader-state': return store.updateReaderState(params, () => assertActive(signal));
+      case 'structure-map': return getStructureMap(store, params, signal, () => assertActive(signal));
+      case 'structure-map-refresh': return refreshStructureMap(store, params, signal, () => assertActive(signal));
+      case 'structure-map-layers': return updateStructureLayers(store, params, signal, () => assertActive(signal));
+      case 'structure-map-file': return inspectStructureFile(store, params, signal, () => assertActive(signal));
       case 'tree': return browseDirectory(store, params, signal);
       case 'view-file': return viewFile(store, params, signal, () => assertActive(signal));
       case 'annotations': { const id = onlyId(params); return store.session(id).draft ? { revision: 0, items: [] } : listAnnotations(store, params); }

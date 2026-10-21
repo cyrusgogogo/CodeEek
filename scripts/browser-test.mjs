@@ -63,7 +63,7 @@ const freshProjects = []; let modelsHold = null; let modelsSeen = null; let pagi
 let selectModelHold = null; let selectModelSeen = null; let createHold = null; let createSeen = null;
 let readingSettings = { revision: 0, defaultModel: null }; let settingsMode = 'healthy'; let settingsHold = null;
 const modelGroups = [{ id: 'local', name: '本地', models: [{ id: 'private-reader', name: 'Private Reader' }] }, { id: 'remote', name: '远程', models: [{ id: 'cloud-reader', name: 'Cloud Reader' }] }];
-const status = { package: manifest.name, version: manifest.version, apiVersion: 1, targetDshVersion: manifest.engines.dsh, enabled: true, capabilities: ['remove-project', 'default-model'], dataDirectory: 'C:\\test-user\\.dsh\\code-reading', dataSource: 'default' };
+const status = { package: manifest.name, version: manifest.version, apiVersion: 1, targetDshVersion: manifest.engines.dsh, enabled: true, capabilities: ['remove-project', 'default-model', 'structure-map-v1'], dataDirectory: 'C:\\test-user\\.dsh\\code-reading', dataSource: 'default' };
 let activePage = null;
 const browser = await chromium.launch({ executablePath: process.env.DSH_TEST_BROWSER ?? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', headless: true });
 try {
