@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { verifyMindMapStability } from './browser-mind-map-stability.mjs';
 
 const id = (kind, number) => `${kind}-${String(number).padStart(8, '0')}-4444-4444-8444-444444444444`;
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -326,6 +327,11 @@ export async function verifyCodeMap({ browser, output, plugin, bootstrap, status
         assert.equal(await tree(plainArticle).count(), 0, 'metadata only marks the first map lesson, not ordinary follow-ups'); await assertFocus(false);
       }
     }
+    const tall = historical('代码地图稳定性', '深层项目地图');
+    sessions.get(tall.sessionId).lessons[0].markdown = '# 项目笔记总览\n\n' + Array.from({ length: 3 }, (_, branch) => `## 分组 ${branch + 1}\n\n` + Array.from({ length: 9 }, (_, child) => `### 模块 ${branch + 1}.${child + 1}\n\n模块职责与证据说明。`).join('\n\n')).join('\n\n');
+    await page.evaluate(sessionId => localStorage.setItem('dsh-code-reading:active', sessionId), tall.sessionId); await mount();
+    const tallArticle = page.locator(`.cr-lesson[data-lesson-id="${tall.lessonId}"]`); await tree(tallArticle).waitFor();
+    const stability = await verifyMindMapStability({ page, root: tree(tallArticle), output });
     const ordinary = historical('理解登录流程', '普通登录逻辑说明');
     sessions.get(ordinary.sessionId).lessons[0].markdown = 'ORDINARY_NOTE_ONLY：普通阅读默认仍直接显示说明。\n\n## 分支一\n\n普通笔记即使带标题，也不应误判为地图。';
     await page.evaluate(sessionId => localStorage.setItem('dsh-code-reading:active', sessionId), ordinary.sessionId); await mount();
@@ -343,7 +349,7 @@ export async function verifyCodeMap({ browser, output, plugin, bootstrap, status
     assert.equal(globalWrites().length, 0, 'map model choices never update global/session settings');
     const storage = await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } })); assert.equal(JSON.stringify(storage).includes('MAP_CONTENT_ONLY'), false); assert.deepEqual(Object.keys(storage.local), ['dsh-code-reading:active']); assert.deepEqual(storage.session, {});
     assert.deepEqual(errors, []); assert.deepEqual(external, []);
-    const report = { passed: true, source: 'intercepted HTTP with the real Client bundle and simulated model responses', loggedInGuiVerified: false, initialAutoDialog: true, defaultMapDocument: true, noModelBeforeConsent: true, noQuestionRequired: true, noGlobalModelMutation: true, selectedCancelNoAdmission: true, pendingCancelLateIgnored: true, failedMapRetained: true, independentIncrementalConsent: true, statusBeforeNetworkRetry: true, focusAndThirtySecondLocalChecks: true, hiddenPageDoesNotScan: true, incompleteScanWarning: true, exactReadingAndEvidenceSession: true, crossProjectAndABATokens: true, pendingWriteDoesNotStealProject: true, legacyCapabilityCompatible: true, noContentStorage: true, completeModuleTree: { branches: branches.length, childrenPerBranch: 2, nodes: 13 }, lazyOriginalNotes: true, secondaryManagementCollapsed: true, localChangeSummaryAndFoldedPaths: true, nodeDetailsAndEvidence: true, originalMarkdownEvidence: true, zoomFitAndBranchCollapse: true, defaultFocusAndExit: true, directSidebarNavigation: true, explicitPathNavigation: true, historicalMapDetection: ['codeMapTask', 'latest-reference', 'legacy-title', 'legacy-topic'], ordinaryReadingUnchanged: true, darkNarrow: true, lightAndDarkDesktopAnd375: true, keyboardAndReducedMotion: true, dangerousHtmlAndExternalMediaBlocked: true, realModelRequest: false, checks: requests.filter(row => row.method === 'code-map-check').length, admissions: modelCalls().length, layouts, previews };
+    const report = { passed: true, source: 'intercepted HTTP with the real Client bundle and simulated model responses', loggedInGuiVerified: false, initialAutoDialog: true, defaultMapDocument: true, noModelBeforeConsent: true, noQuestionRequired: true, noGlobalModelMutation: true, selectedCancelNoAdmission: true, pendingCancelLateIgnored: true, failedMapRetained: true, independentIncrementalConsent: true, statusBeforeNetworkRetry: true, focusAndThirtySecondLocalChecks: true, hiddenPageDoesNotScan: true, incompleteScanWarning: true, exactReadingAndEvidenceSession: true, crossProjectAndABATokens: true, pendingWriteDoesNotStealProject: true, legacyCapabilityCompatible: true, noContentStorage: true, completeModuleTree: { branches: branches.length, childrenPerBranch: 2, nodes: 13 }, lazyOriginalNotes: true, secondaryManagementCollapsed: true, localChangeSummaryAndFoldedPaths: true, nodeDetailsAndEvidence: true, originalMarkdownEvidence: true, zoomFitAndBranchCollapse: true, defaultFocusAndExit: true, directSidebarNavigation: true, explicitPathNavigation: true, historicalMapDetection: ['codeMapTask', 'latest-reference', 'legacy-title', 'legacy-topic'], ordinaryReadingUnchanged: true, stability, darkNarrow: true, lightAndDarkDesktopAnd375: true, keyboardAndReducedMotion: true, dangerousHtmlAndExternalMediaBlocked: true, realModelRequest: false, checks: requests.filter(row => row.method === 'code-map-check').length, admissions: modelCalls().length, layouts, previews };
     await writeFile(path.join(output, 'code-map-report.json'), JSON.stringify(report, null, 2)); return report;
   } catch (error) {
     await page.screenshot({ path: path.join(output, 'code-map-failure.png'), fullPage: true }).catch(() => {});
@@ -361,7 +367,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   const manifest = JSON.parse(await readFile('package.json', 'utf8'));
   const bootstrap = await build({ stdin: { contents: `import React from 'react';import * as jsx from 'react/jsx-runtime';import * as ReactDOM from 'react-dom';import {createRoot} from 'react-dom/client';window.React=React;window.createRoot=createRoot;window.__ModuleLoader__={load(row){window.plugin=row.factory(id=>{if(id==='react')return React;if(id==='react/jsx-runtime')return jsx;if(id==='react-dom')return ReactDOM;throw Error('Unexpected external '+id);});}};`, resolveDir: process.cwd(), loader: 'js' }, bundle: true, write: false, format: 'iife', platform: 'browser' });
   const plugin = await readFile(process.env.DSH_TEST_CLIENT_BUNDLE ?? 'lib/client.js', 'utf8');
-  const browser = await chromium.launch({ executablePath: process.env.DSH_TEST_BROWSER ?? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', headless: true });
+  const browser = await chromium.launch({ executablePath: process.env.DSH_TEST_BROWSER ?? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', headless: true, ignoreDefaultArgs: ['--hide-scrollbars'] });
   try { console.log(JSON.stringify(await verifyCodeMap({ browser, output, plugin, bootstrap: bootstrap.outputFiles[0].text, status: { package: manifest.name, version: manifest.version, apiVersion: 1, targetDshVersion: manifest.engines.dsh, enabled: true, dataDirectory: 'D:\\fixtures\\reading-archive' } }), null, 2)); }
   finally { await browser.close(); }
 }

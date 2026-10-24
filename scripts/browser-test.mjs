@@ -66,7 +66,7 @@ let readingSettings = { revision: 0, defaultModel: null }; let settingsMode = 'h
 const modelGroups = [{ id: 'local', name: '本地', models: [{ id: 'private-reader', name: 'Private Reader' }] }, { id: 'remote', name: '远程', models: [{ id: 'cloud-reader', name: 'Cloud Reader' }] }];
 const status = { package: manifest.name, version: manifest.version, apiVersion: 1, targetDshVersion: manifest.engines.dsh, enabled: true, capabilities: ['remove-project', 'default-model', 'structure-map-v1'], dataDirectory: 'C:\\test-user\\.dsh\\code-reading', dataSource: 'default' };
 let activePage = null;
-const browser = await chromium.launch({ executablePath: process.env.DSH_TEST_BROWSER ?? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', headless: true });
+const browser = await chromium.launch({ executablePath: process.env.DSH_TEST_BROWSER ?? 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', headless: true, ignoreDefaultArgs: ['--hide-scrollbars'] });
 try {
   const page = await browser.newPage({ viewport: { width: 1380, height: 1050 }, locale: 'zh-CN' }); activePage = page; page.on('pageerror', e => errors.push(e.message));
   page.on('request', request => { if (!request.url().startsWith('http://127.0.0.1:19387') && /^https?:/.test(request.url())) external.push(request.url()); });

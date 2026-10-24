@@ -54,13 +54,20 @@ export function MindMap({ title, markdown, conclusion, sections, Markdown, openE
   }, [model]);
   useEffect(() => {
     const element = viewport.current; if (!element) return;
-    const measure = () => {
-      if (!element.clientWidth || !element.clientHeight) return;
-      setViewportSize(previous => previous.width === element.clientWidth && previous.height === element.clientHeight ? previous : { width: element.clientWidth, height: element.clientHeight });
+    const measure = rect => {
+      // clientWidth/clientHeight round fractional CSS pixels up. Feeding those
+      // integers back into the stage can toggle both scrollbars every frame at
+      // browser zoom/DPI boundaries. The observer's contentRect is in layout CSS
+      // pixels (unlike getBoundingClientRect, which includes CSS transforms).
+      const width = Math.floor(rect?.width ?? Math.max(0, element.clientWidth - 1));
+      const height = Math.floor(rect?.height ?? Math.max(0, element.clientHeight - 1));
+      if (!width || !height) return;
+      setViewportSize(previous => previous.width === width && previous.height === height ? previous : { width, height });
     };
-    measure(); const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
-    observer?.observe(element); window.addEventListener('resize', measure);
-    return () => { observer?.disconnect(); window.removeEventListener('resize', measure); };
+    const fallback = () => measure();
+    fallback(); const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => measure(entries[0]?.contentRect)) : null;
+    observer?.observe(element); if (!observer) window.addEventListener('resize', fallback);
+    return () => { observer?.disconnect(); window.removeEventListener('resize', fallback); };
   }, []);
   useEffect(() => {
     if (!viewport.current) return;
