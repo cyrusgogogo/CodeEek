@@ -44,9 +44,10 @@ function LayerEditor({ value, busy, blocked, onSave, onClose }) {
 
 // One bounded map for the active project. memory contains navigation metadata only;
 // requests, inspected conclusions, and inventories stay in this mounted module.
-export function StructureMap({ project, sessionId, enabled, active, memory, onNavigate, onOpenSource, onOpenReading, onReturnDocument }) {
+export function StructureMap({ project, sessionId, enabled, active, memory, onNavigate, onOpenSource, onOpenReading, onReturnDocument, overview: aiOverview }) {
   const [repoId, setRepoId] = useState(() => project.repositories.some(repo => repo.id === memory.repoId) ? memory.repoId : project.repositories[0]?.id ?? '');
   const [view, setView] = useState(() => memory.view ?? frame());
+  const [mapMode, setMapMode] = useState(() => memory.mapMode ?? (aiOverview ? 'mindmap' : 'paths'));
   const [history, setHistory] = useState(() => memory.history ?? []);
   const [loaded, setLoaded] = useState(null); const [detail, setDetail] = useState(null);
   const [loading, setLoading] = useState(''); const [fileLoading, setFileLoading] = useState(false); const [error, setError] = useState(''); const [fileError, setFileError] = useState('');
@@ -101,9 +102,16 @@ export function StructureMap({ project, sessionId, enabled, active, memory, onNa
     if (!active || !data || !restore.current || view.location.kind === 'file' && !inspected && !fileError && data.files.some(file => file.path === view.location.path)) return;
     const id = requestAnimationFrame(() => {
       if (!alive.current || scope.current !== token || !root.current) return;
-      const saved = latest.current.view; root.current.scrollTop = saved.scrollTop;
-      const target = [...root.current.querySelectorAll('[data-map-focus]')].find(node => node.dataset.mapFocus === saved.focusKey);
-      (target ?? heading.current)?.focus({ preventScroll: true }); restore.current = false;
+      const saved = latest.current.view; const focused = document.activeElement;
+      // A keyboard/pointer user may already have focused the new route before
+      // this frame. Never steal that focus (or scroll) back to the old route.
+      const userFocused = root.current.contains(focused) && focused?.hasAttribute('data-map-focus');
+      if (!userFocused) {
+        root.current.scrollTop = saved.scrollTop;
+        const target = [...root.current.querySelectorAll('[data-map-focus]')].find(node => node.dataset.mapFocus === saved.focusKey);
+        (target ?? heading.current)?.focus({ preventScroll: true });
+      }
+      restore.current = false;
     });
     return () => cancelAnimationFrame(id);
   }, [active, token, data, view, inspected, fileError]);
@@ -126,7 +134,10 @@ export function StructureMap({ project, sessionId, enabled, active, memory, onNa
   const busy = !!loading; const mutating = !!loading && loading !== 'structure-map';
   const fileButton = file => <button type="button" className="cr-map-row" key={file.path} data-map-path={file.path} data-map-focus={`file:${file.path}`} title={file.path} onClick={() => go({ kind: 'file', layerId: file.layerId, modulePath: file.modulePath, path: file.path })}><EntryIcon path={file.path} /><span><strong>{file.path.split('/').at(-1)}</strong><small>{file.path}</small></span><small>{file.readingCount ? `${file.readingCount} 个历史知识点 · 待核验` : '暂无历史关联'}</small></button>;
   return <section ref={root} hidden={!active} className="cr-structure-map" aria-label="项目地图" data-repo-id={repoId} data-map-kind={location.kind} data-index-revision={data?.revision} onScroll={() => { if (!restore.current && root.current?.getClientRects().length) { const next = { ...latest.current.view, scrollTop: root.current.scrollTop }; latest.current.view = next; memory.view = next; } }}>
-    <header className="cr-map-header"><div><p className="cr-map-eyebrow">项目结构 · 渐进式导航</p><h1 ref={heading} tabIndex={-1}>{title}</h1></div>{onReturnDocument && <button type="button" onClick={() => { saveMemory(); onReturnDocument(); }}>返回上个文档</button>}</header>
+    {aiOverview && <div className="cr-map-viewbar"><nav aria-label="地图视图">{[['mindmap', '思维导图'], ['paths', '路径导航']].map(([value, label]) => <button type="button" key={value} aria-pressed={mapMode === value} onClick={() => { saveMemory(); onNavigate(); memory.mapMode = value; setMapMode(value); root.current?.scrollTo({ top: 0 }); }}>{label}</button>)}</nav>{onReturnDocument && <button type="button" className="cr-map-back-document" onClick={() => { saveMemory(); onReturnDocument(); }}>返回上个文档</button>}</div>}
+    {aiOverview && mapMode === 'mindmap' && <><h1 ref={heading} tabIndex={-1} className="cr-sr-only">项目地图</h1>{aiOverview}</>}
+    <div className="cr-map-paths" hidden={!!aiOverview && mapMode !== 'paths'}>
+    <header className="cr-map-header"><div><p className="cr-map-eyebrow">项目结构 · 路径导航</p><h1 ref={!aiOverview || mapMode === 'paths' ? heading : undefined} tabIndex={-1}>{title}</h1></div>{!aiOverview && onReturnDocument && <button type="button" onClick={() => { saveMemory(); onReturnDocument(); }}>返回上个文档</button>}</header>
     <div className="cr-map-toolbar">
       {project.repositories.length > 1 ? <label>地图仓库<select aria-label="地图仓库" value={repoId} disabled={mutating || editing} onChange={event => changeRepo(event.target.value)}>{project.repositories.map(item => <option key={item.id} value={item.id}>{item.name} · {item.root}</option>)}</select></label> : <span className="cr-map-repo" title={repo?.root}>{repo?.name}</span>}
       <button type="button" disabled={!enabled || busy || blocked || !data || editing} onClick={() => void load('structure-map-refresh', { expectedRevision: data.revision })}>{data?.indexedAt ? '刷新结构索引' : '建立结构索引'}</button>
@@ -172,5 +183,6 @@ export function StructureMap({ project, sessionId, enabled, active, memory, onNa
         </>}
       </>}
     </>}
+    </div>
   </section>;
 }

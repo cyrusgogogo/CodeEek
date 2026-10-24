@@ -1,4 +1,11 @@
-/* Bounded, text-first project navigation in the existing central IDE document. */
+/* The visual overview and bounded path navigation share one central document. */
+.cr-map-viewbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin:0 0 24px; padding-bottom:10px; border-bottom:1px solid var(--cr-border); }
+.cr-map-viewbar > nav { display:flex; gap:4px; }
+.cr-page .cr-map-viewbar button { border-color:transparent; background:transparent; color:var(--cr-muted); padding:6px 12px; }
+.cr-page .cr-map-viewbar button[aria-pressed=true] { color:var(--cr-text); background:var(--cr-raised); border-color:var(--cr-border); font-weight:600; }
+.cr-page .cr-map-viewbar .cr-map-back-document { font-size:11px; }
+.cr-map-paths { min-width:0; }
+.cr-map-paths[hidden] { display:none; }
 .cr-workbench.cr-ide .cr-structure-map { flex:1; min-height:0; min-width:0; overflow:auto; padding:20px 24px 32px; background:var(--cr-bg); scrollbar-gutter:stable; scroll-padding:12px; }
 .cr-structure-map :is(h1,h2,h3,p) { overflow-wrap:anywhere; }
 .cr-structure-map h1 { margin:0; font-size:22px; line-height:1.4; }

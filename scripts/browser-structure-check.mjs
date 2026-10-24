@@ -16,6 +16,8 @@ async function openMap(page) {
   if (await returnButton.isVisible()) await returnButton.click();
   else await page.getByRole('button', { name: '项目地图', exact: true }).first().click();
   await mapRoot(page).waitFor();
+  const paths = mapRoot(page).getByRole('button', { name: '路径导航', exact: true });
+  if (await paths.isVisible() && await paths.getAttribute('aria-pressed') !== 'true') await paths.click();
 }
 async function findFile(page, relative) {
   const overview = mapRoot(page).getByRole('navigation', { name: '项目地图路径', exact: true }).getByRole('button', { name: '总览', exact: true });
@@ -60,9 +62,20 @@ export async function verifyStructureMap({ page, runtime, repo, repoId, project,
     await page.screenshot({ path: path.join(output, 'structure-map-overview.png'), fullPage: true, animations: 'disabled' }); shots.push('structure-map-overview.png');
 
     // Real hierarchy, not a second flat file tree. The native buttons remain keyboard operable.
+    // Simulate the user focusing a newly rendered module before the pending
+    // restore animation frame; that frame must not steal focus back to h1.
+    await mapRoot(page).evaluate(root => {
+      const observer = new MutationObserver(() => {
+        const target = root.querySelector('[data-map-module="src"]');
+        if (root.dataset.mapKind === 'layer' && target) { target.focus(); observer.disconnect(); }
+      });
+      observer.observe(root, { attributes: true, childList: true, subtree: true });
+    });
     const layer = mapRoot(page).locator('[data-map-layer="core"]').first(); await layer.focus(); await page.keyboard.press('Enter');
     await mapRoot(page).getByRole('navigation', { name: '项目地图路径', exact: true }).waitFor();
-    const module = mapRoot(page).locator('[data-map-module="src"]').first(); await module.waitFor(); await module.focus(); await page.keyboard.press('Enter');
+    const module = mapRoot(page).locator('[data-map-module="src"]').first(); await module.waitFor(); await tick(page);
+    assert.equal(await module.evaluate(node => document.activeElement === node), true, 'deferred route restoration must preserve the new module focus');
+    await page.keyboard.press('Enter');
     await mapFile(page, 'src/methods.js').waitFor(); await mapFile(page, 'src/methods.js').click();
     await page.locator('.cr-structure-map[data-map-kind="file"]').waitFor();
     const detail = await runtime.dispatch('structure-map-file', { ...parameters, path: 'src/methods.js' });

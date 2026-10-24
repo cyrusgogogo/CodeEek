@@ -71,7 +71,7 @@ test('Host 与 scoped preset 接线：只读模式、五个专用工具和私有
 test('安装状态只读返回同源版本与目录来源，不创建项目或请求模型', async t => {
   const f = await nativeFixture(t); const before = f.runtime.store.list(); const status = await f.runtime.dispatch('status', {});
   assert.equal(status.package, 'dsh-code-reading'); assert.equal(status.version, JSON.parse(await fs.readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
-  assert.equal(status.apiVersion, 1); assert.deepEqual(status.capabilities, ['remove-project', 'default-model', 'structure-map-v1']); assert.equal(status.targetDshVersion, '0.2.1-rc.2'); assert.equal(status.dataDirectory, path.resolve(f.dataDir)); assert.equal(status.dataSource, 'config.dataDir');
+  assert.equal(status.apiVersion, 1); assert.deepEqual(status.capabilities, ['remove-project', 'default-model', 'structure-map-v1', 'code-map-v1']); assert.equal(status.targetDshVersion, '0.2.1-rc.3'); assert.equal(status.dataDirectory, path.resolve(f.dataDir)); assert.equal(status.dataSource, 'config.dataDir');
   assert.deepEqual(f.runtime.store.list(), before); assert.equal(f.ctx.calls.length, 0);
 });
 test('不支持的请求类型也返回统一错误 envelope', async t => {
@@ -437,4 +437,133 @@ test('任一同项目会话运行中拒绝移除，prompt异步准入与移除�
   const admitted = f.runtime.dispatch('prompt', promptRequest(f)); await entered.promise;
   const removal = f.runtime.dispatch('remove-project', params); const refused = assert.rejects(removal, { code: 'AGENT_BUSY' }); release.resolve(); await admitted; await refused;
   assert.equal(f.ctx.calls.length, 1); assert.equal((await f.runtime.dispatch('list', {})).projects.length, 1);
+});
+
+async function mapFixture(t) {
+  const f = await nativeFixture(t); applyPreset(f.ctx);
+  f.ctx.sessionController.modelCatalog = async () => ({ groups: [{ id: 'private', models: [{ id: 'map-reader' }] }] });
+  f.mapModel = { provider: 'private', model: 'map-reader' }; return f;
+}
+const mapRequest = (f, revision = 0) => ({ projectId: f.project.id, expectedRevision: revision, requestId: randomUUID(), model: f.mapModel, consent: true });
+async function publishMap(f, task, title = '仓库代码地图') {
+  const agent = f.ctx.live.get(task.sessionId); agent.session.append('turn/start', { turn: 1 }); agent.session.append('step/start', { step: 1 });
+  const { evidence } = await f.runtime.store.read(task.sessionId, { repoId: f.project.repositories[0].id, path: 'entry.ts' });
+  await f.ctx.definitions.get('reading_publish').execute({ expectedRevision: f.runtime.store.session(task.sessionId).revision, title, markdown: '## 入口\nentry.ts 导出常量；后续先读入口再查引用。', conclusion: '入口是 entry.ts。', claims: [{ kind: 'fact', text: '入口导出常量', evidenceIds: [evidence.id] }], nextQuestions: ['谁读取常量？'], codeUnits: [entryUnit(evidence)] }, { agent, callId: randomUUID(), concludeTurn() {} });
+  agent.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } }); agent.status = 'idle';
+  return f.runtime.dispatch('code-map', { projectId: f.project.id });
+}
+
+test('首次仓库带引导标记，未授权只检测本地变化不建任务或调用模型', async t => {
+  const f = await mapFixture(t); assert.equal(f.project.codeMapOnboarding, true); const before = f.runtime.store.sessions.size;
+  const empty = await f.runtime.dispatch('code-map', { projectId: f.project.id }); assert.equal(empty.latest, null); assert.equal(empty.task, null); assert.equal(empty.revision, 0);
+  const checked = await f.runtime.dispatch('code-map-check', { projectId: f.project.id }); assert.equal(checked.changes.added[0].path, 'entry.ts'); assert.equal(checked.revision, 0);
+  await assert.rejects(f.runtime.dispatch('code-map-generate', { ...mapRequest(f), consent: false }));
+  await assert.rejects(f.runtime.dispatch('code-map-generate', { ...mapRequest(f), model: { provider: 'wrong', model: 'unknown' } }), { code: 'DEFAULT_MODEL_UNAVAILABLE' });
+  assert.equal(f.runtime.store.sessions.size, before); assert.equal(f.ctx.calls.length, 0);
+});
+
+test('授权后自动入队原生地图任务，模型局部固定且同请求不会重复调用', async t => {
+  const f = await mapFixture(t); const args = mapRequest(f); const source = await fs.readFile(path.join(f.repo, 'entry.ts'));
+  const result = await f.runtime.dispatch('code-map-generate', args); assert.equal(result.task.status, 'running'); assert.equal(result.task.mode, 'initial'); assert.equal(result.latest, null);
+  const state = f.runtime.store.session(result.task.sessionId); assert.equal(state.modelSelectionManaged, true); assert.equal(state.codeMapTask.requestId, args.requestId); assert.equal(state.draft, false);
+  assert.equal(f.ctx.calls.length, 1); assert.match(f.ctx.calls[0].content[0].text, /代码地图/); assert.match(f.ctx.calls[0].content[0].text, /不可信/);
+  assert.deepEqual(f.ctx.defaultModel, { provider: 'remote', model: 'reader' }); assert.deepEqual((await f.runtime.dispatch('snapshot', { sessionId: state.id })).modelSelection, f.mapModel);
+  await f.runtime.dispatch('code-map-generate', args); assert.equal(f.ctx.calls.length, 1); assert.equal(f.ctx.definitions.size, 5);
+  const ready = await publishMap(f, result.task); assert.equal(ready.task.status, 'completed'); assert.equal(ready.latest.title, '仓库代码地图'); assert.equal(ready.latest.truncated, false);
+  await f.runtime.dispatch('code-map-generate', args); assert.equal(f.ctx.calls.length, 1); assert.deepEqual(await fs.readFile(path.join(f.repo, 'entry.ts')), source);
+});
+
+test('地图成为后续阅读目录上下文，普通提问重读核验而不复用跨会话证据', async t => {
+  const f = await mapFixture(t); const running = await f.runtime.dispatch('code-map-generate', mapRequest(f)); await publishMap(f, running.task);
+  await f.runtime.dispatch('prompt', promptRequest(f)); const catalog = await f.ctx.definitions.get('reading_catalog').execute({}, { agent: f.ctx.live.get(f.sessionId) });
+  assert.equal(catalog.codeMap.title, '仓库代码地图'); assert.match(catalog.codeMap.note, /不是当前代码证据/); assert.match(catalog.codeMap.note, /不沿用跨会话证据/);
+  assert.match(f.ctx.promptSections.get('code-reading-tutor').text({ agent: f.ctx.live.get(f.sessionId) }), /仓库代码地图/);
+  const restoredCtx = hostContext(); await applyHost(restoredCtx, { dataDir: f.dataDir });
+  const restored = await getRuntime(restoredCtx.root).dispatch('code-map', { projectId: f.project.id }); assert.equal(restored.latest.title, '仓库代码地图'); assert.equal(restoredCtx.calls.length, 0);
+});
+
+test('同路径源码变化只提示增量；明确允许后沿旧地图和差异更新，完成前保留旧图', async t => {
+  const f = await mapFixture(t); const running = await f.runtime.dispatch('code-map-generate', mapRequest(f)); const original = await publishMap(f, running.task);
+  await fs.writeFile(path.join(f.repo, 'entry.ts'), 'export const answer = 43;\n'); await fs.writeFile(path.join(f.repo, 'new.md'), '# 新文档\n');
+  const changed = await f.runtime.dispatch('code-map-check', { projectId: f.project.id });
+  assert.deepEqual(changed.changes.modified.map(row => row.path), ['entry.ts']); assert.deepEqual(changed.changes.added.map(row => row.path), ['new.md']); assert.equal(f.ctx.calls.length, 1);
+  const incremental = await f.runtime.dispatch('code-map-generate', mapRequest(f, changed.revision)); assert.equal(incremental.task.mode, 'incremental'); assert.equal(incremental.latest.lessonId, original.latest.lessonId);
+  assert.match(f.ctx.calls[1].content[0].text, /优先只读新增、修改/); assert.match(f.ctx.calls[1].content[0].text, /previousMap/); assert.match(f.ctx.calls[1].content[0].text, /new.md/);
+  const updated = await publishMap(f, incremental.task, '更新后的代码地图'); assert.notEqual(updated.latest.lessonId, original.latest.lessonId);
+  await fs.unlink(path.join(f.repo, 'new.md')); const deleted = await f.runtime.dispatch('code-map-check', { projectId: f.project.id }); assert.equal(deleted.changes.deleted[0].path, 'new.md');
+  assert.equal(f.ctx.calls.length, 2);
+});
+
+test('模型失败、取消和重启中断不覆盖已有地图，也不自动重试任务', async t => {
+  const f = await mapFixture(t); const running = await f.runtime.dispatch('code-map-generate', mapRequest(f)); const ready = await publishMap(f, running.task);
+  const next = await f.runtime.dispatch('code-map-generate', mapRequest(f, ready.revision)); const agent = f.ctx.live.get(next.task.sessionId);
+  agent.status = 'idle'; agent.session.append('turn/end', { reason: { kind: 'error' } });
+  const failed = await f.runtime.dispatch('code-map', { projectId: f.project.id }); assert.equal(failed.task.status, 'failed'); assert.equal(failed.latest.lessonId, ready.latest.lessonId);
+  const retry = await f.runtime.dispatch('code-map-generate', mapRequest(f, failed.revision)); const stopped = await f.runtime.dispatch('code-map-cancel', { projectId: f.project.id, requestId: retry.task.requestId });
+  assert.equal(stopped.task.status, 'cancelled'); assert.equal(stopped.latest.lessonId, ready.latest.lessonId);
+  await assert.rejects(publishMap(f, retry.task), { code: 'PROMPT_CANCELLED' });
+  const last = await f.runtime.dispatch('code-map-generate', mapRequest(f, stopped.revision)); assert.equal(last.task.status, 'running');
+  const restarted = hostContext(); await applyHost(restarted, { dataDir: f.dataDir }); const recovered = await getRuntime(restarted.root).dispatch('code-map', { projectId: f.project.id });
+  assert.equal(recovered.task.status, 'failed'); assert.equal(recovered.latest.lessonId, ready.latest.lessonId); assert.equal(restarted.calls.length, 0);
+});
+
+test('地图网络结果未知时只核对原任务，不盲目重新发送', async t => {
+  const f = await mapFixture(t); const original = f.ctx.sessionController.prompt; const args = mapRequest(f);
+  f.ctx.sessionController.prompt = async request => { await original(request); throw new Error('模拟确认丢失'); };
+  await assert.rejects(f.runtime.dispatch('code-map-generate', args), /确认丢失/); const state = await f.runtime.dispatch('code-map', { projectId: f.project.id }); assert.equal(state.task.status, 'running');
+  await f.runtime.dispatch('code-map-generate', args); assert.equal(f.ctx.calls.length, 1);
+});
+
+test('同项目并发生成只准入一次，晚到旧revision不能触发新任务', async t => {
+  const f = await mapFixture(t); const results = await Promise.allSettled([f.runtime.dispatch('code-map-generate', mapRequest(f)), f.runtime.dispatch('code-map-generate', mapRequest(f))]);
+  assert.equal(results.filter(row => row.status === 'fulfilled').length, 1); assert.equal(results.find(row => row.status === 'rejected').reason.code, 'STALE_CODE_MAP'); assert.equal(f.ctx.calls.length, 1);
+});
+
+for (const action of ['cancel', 'disable', 'abort']) test(`地图等待模型目录期间${action}不会迟到发送源码`, async t => {
+  const f = await mapFixture(t); const args = mapRequest(f); const entered = deferred(); const release = deferred(); const catalog = f.ctx.sessionController.modelCatalog;
+  f.ctx.sessionController.modelCatalog = async () => { entered.resolve(); await release.promise; return catalog(); };
+  const controller = new AbortController(); const generating = f.runtime.dispatch('code-map-generate', args, controller.signal);
+  const rejected = assert.rejects(generating, action === 'abort' ? { name: 'AbortError' } : { code: action === 'disable' ? 'READING_UNAVAILABLE' : 'PROMPT_CANCELLED' }); await entered.promise;
+  let cancelling;
+  if (action === 'cancel') cancelling = f.runtime.dispatch('code-map-cancel', { projectId: f.project.id, requestId: args.requestId }).catch(error => { assert.equal(error.code, 'CODE_MAP_TASK_CHANGED'); });
+  if (action === 'disable') await f.ctx.dispose();
+  if (action === 'abort') controller.abort();
+  release.resolve(); await rejected; await cancelling; assert.equal(f.ctx.calls.length, 0);
+});
+
+test('地图取消按项目隔离，相同requestId不会阻止另一个项目生成', async t => {
+  const f = await mapFixture(t); const second = await f.runtime.dispatch('create-project', { repositories: [{ path: f.repo }] }); const requestId = randomUUID();
+  const first = await f.runtime.dispatch('code-map-generate', { ...mapRequest(f), requestId });
+  await f.runtime.dispatch('code-map-cancel', { projectId: f.project.id, requestId });
+  const other = await f.runtime.dispatch('code-map-generate', { ...mapRequest(f), projectId: second.id, requestId });
+  assert.equal(other.task.status, 'running'); assert.notEqual(other.task.sessionId, first.task.sessionId); assert.equal(f.ctx.calls.length, 2);
+});
+
+test('地图首轮只能由内部授权任务入队，同UUID伪造普通prompt也不能抢占', async t => {
+  const f = await mapFixture(t); const args = mapRequest(f); const entered = deferred(); const release = deferred(); const create = f.ctx.sessionController.create;
+  f.ctx.sessionController.create = async value => { const result = await create(value); entered.resolve(value.sessionId); await release.promise; return result; };
+  const generating = f.runtime.dispatch('code-map-generate', args); const sessionId = await entered.promise;
+  for (const requestId of [randomUUID(), args.requestId]) await assert.rejects(f.runtime.dispatch('prompt', { sessionId, requestId, text: '普通问题不能冒充代码地图', expectedRevision: 2, expectedModel: f.mapModel }), { code: 'CODE_MAP_TASK_RESERVED' });
+  assert.equal(f.ctx.calls.length, 0); release.resolve(); const running = await generating; const ready = await publishMap(f, running.task);
+  await f.runtime.dispatch('prompt', { sessionId, requestId: randomUUID(), text: '地图完成后正常追问', expectedRevision: 2, expectedModel: f.mapModel });
+  assert.equal(ready.task.status, 'completed'); assert.equal(f.ctx.calls.length, 2);
+});
+
+test('只有待核对的变化将地图上下文标为未知且部分扫描，而不是无变化', async t => {
+  const f = await mapFixture(t); const running = await f.runtime.dispatch('code-map-generate', mapRequest(f)); await publishMap(f, running.task);
+  await fs.writeFile(path.join(f.repo, 'entry.ts'), Buffer.from([0, 1, 2])); const checked = await f.runtime.dispatch('code-map-check', { projectId: f.project.id });
+  assert.equal(checked.changes.changed, false); assert.equal(checked.changes.uncertain.length, 1);
+  const catalog = await f.ctx.definitions.get('reading_catalog').execute({}, { agent: f.ctx.live.get(f.sessionId) }); assert.equal(catalog.codeMap.stale, null); assert.equal(catalog.codeMap.partial, true);
+});
+
+test('已停止地图任务在发布原子提交期间取消也不能写入完成状态', async t => {
+  const f = await mapFixture(t); const running = await f.runtime.dispatch('code-map-generate', mapRequest(f)); const entered = deferred(); const release = deferred(); const original = f.runtime.store.audit.bind(f.runtime.store);
+  f.runtime.store.audit = async (...args) => { if (args[1] === 'lesson-published') { entered.resolve(); await release.promise; } return original(...args); };
+  const publishing = publishMap(f, running.task); const refused = assert.rejects(publishing, { code: 'PROMPT_CANCELLED' }); await entered.promise;
+  const stopping = f.runtime.dispatch('code-map-cancel', { projectId: f.project.id, requestId: running.task.requestId });
+  // Cancellation increments the native epoch without waiting for the store publication lock.
+  const cancelledNative = deferred(); const nativeCancel = f.ctx.sessionController.cancel;
+  f.ctx.sessionController.cancel = async args => { const result = await nativeCancel(args); cancelledNative.resolve(); return result; };
+  await cancelledNative.promise; release.resolve(); await refused; const stopped = await stopping;
+  assert.equal(stopped.latest, null); assert.equal(f.runtime.store.session(running.task.sessionId).lessons.length, 0);
 });

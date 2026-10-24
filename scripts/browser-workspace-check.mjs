@@ -222,6 +222,8 @@ export async function verifyFileWorkspace({ browser, output, plugin, bootstrap }
   const page = await browser.newPage({ viewport: { width: 1560, height: 1100 }, locale: 'zh-CN' }); const errors = []; const external = []; let hold = null; let held = null; let partialView = false;
   try {
     await host.apply(ctx, { dataDir: path.join(root, 'reading-artifacts') }); runtime = getRuntime(ctx.root); const project = await runtime.dispatch('create-project', { title: '文件阅读与批注 · 隔离回归', repositories: [{ name: '演示仓库', path: repo }] }); const { sessionId } = await runtime.dispatch('create-session', { projectId: project.id }); const repoId = project.repositories[0].id;
+    // This suite restores a pre-map project; onboarding has its own full browser regression.
+    delete runtime.store.project(project.id).codeMapOnboarding;
     page.on('pageerror', error => errors.push(error.message)); page.on('request', request => { if (/^https?:/.test(request.url()) && !request.url().startsWith('http://127.0.0.1:19387/')) external.push(request.url()); });
     await page.route('**/*', async route => {
       if (route.request().url().endsWith('/workspace-component-test')) return route.fulfill({ contentType: 'text/html', body: '<!doctype html><meta charset="utf-8"><style>html,body,#root{height:100%;margin:0;font-family:"Microsoft YaHei",system-ui}</style><div id="root"></div>' });
@@ -394,6 +396,7 @@ export async function verifyFileWorkspace({ browser, output, plugin, bootstrap }
     const rootsDir = path.join(root, 'root-navigation'); await fs.mkdir(rootsDir); const rootsA = path.join(rootsDir, 'a'); const rootsB = path.join(rootsDir, 'b'); await fs.mkdir(rootsA); await fs.mkdir(rootsB);
     await fs.writeFile(path.join(rootsA, 'entry.ts'), 'export const ROOT_A_ONLY = 1; // COMMON_ROOT_SENTINEL\n'); await fs.writeFile(path.join(rootsB, 'entry.ts'), 'export const ROOT_B_ONLY = 2; // COMMON_ROOT_SENTINEL\n');
     const multiProject = await runtime.dispatch('create-project', { title: '多仓根导航隔离回归', repositories: [{ name: '同名仓库', path: rootsA }, { name: '同名仓库', path: rootsB }] }); const multiId = (await runtime.dispatch('create-session', { projectId: multiProject.id })).sessionId; const [rootARepo, rootBRepo] = multiProject.repositories;
+    delete runtime.store.project(multiProject.id).codeMapOnboarding;
     await page.evaluate(id => { window.readingRoot.unmount(); localStorage.setItem('dsh-code-reading:active', id); const slot = window.slots['main:code-reading']; window.readingRoot = window.createRoot(document.getElementById('root')); window.readingRoot.render(window.React.createElement(slot.component, { ...slot.options.inject(), useWorkspaces: select => select({ items: [] }) })); }, multiId);
     await showFiles(page); const rootTree = page.locator('.cr-file-tree'); const rootA = rootTree.locator(`.cr-tree-root[data-repo-id="${rootARepo.id}"]`); const rootB = rootTree.locator(`.cr-tree-root[data-repo-id="${rootBRepo.id}"]`);
     await rootTree.locator(`.cr-tree-root[data-repo-id="${rootARepo.id}"][aria-current="true"]`).waitFor(); assert.equal(await rootTree.locator('.cr-tree-root').count(), 2); assert.equal(await page.locator('.cr-repo-picker,select[aria-label="文件目录仓库"]').count(), 0);

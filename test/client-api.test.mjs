@@ -73,6 +73,11 @@ test('就绪判断要求包版本、接口、目标和启用状态全部一致',
   assert.equal(validateHostStatus(healthy), healthy);
   for (const wrong of [null, { ...healthy, version: '0.1.1' }, { ...healthy, apiVersion: 999 }, { ...healthy, enabled: false }, { ...healthy, targetDshVersion: 'unknown' }]) assert.throws(() => validateHostStatus(wrong), { code: 'VERSION_MISMATCH' });
 });
+test('rc.3 页面拒绝同包版本的 rc.2 Host，不能只刷新 Client 绕过升级', () => {
+  assert.equal(TARGET_DSH_VERSION, '0.2.1-rc.3');
+  const old = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: '0.2.1-rc.2', enabled: true, dataDirectory: 'fixture-root', capabilities: ['remove-project', 'default-model', 'structure-map-v1'] };
+  assert.throws(() => validateHostStatus(old), error => error.code === 'VERSION_MISMATCH' && /完整退出/.test(error.message));
+});
 test('同版本旧 Host 没有仓库移除能力也不能通过就绪检查', () => {
   const old = { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, dataDirectory: 'fixture-root' };
   for (const capabilities of [undefined, null, [], 'remove-project', ['other-feature']]) assert.throws(() => validateHostStatus({ ...old, capabilities }), error => error.code === 'VERSION_MISMATCH' && /仓库移除/.test(error.message) && /完整退出/.test(error.message));

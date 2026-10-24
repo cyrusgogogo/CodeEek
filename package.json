@@ -7,7 +7,7 @@
   "packageManager": "pnpm@11.7.0",
   "engines": {
     "node": ">=22.18.0",
-    "dsh": "0.2.1-rc.2"
+    "dsh": "0.2.1-rc.3"
   },
   "main": "./lib/index.js",
   "exports": {
@@ -49,11 +49,11 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-client-connection": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-skill": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
-    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
+    "@deepseek-ai/dsh-agent-preset-registry": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-client-connection": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-skill": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.3"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-agent-preset-registry": {
@@ -77,7 +77,7 @@
     "@deepseek-ai/cordis-plugin-group": "1.0.5",
     "@deepseek-ai/cordis-plugin-include": "1.0.10",
     "@deepseek-ai/cordis-plugin-loader": "1.0.6",
-    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.3",
     "@radix-ui/react-select": "2.4.1",
     "dompurify": "3.4.17",
     "esbuild": "0.25.12",

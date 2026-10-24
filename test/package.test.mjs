@@ -54,10 +54,10 @@ const archive = files => gzipSync(tarRows([...files].map(([name, bytes]) => ({ n
 test('发布契约对同一文件集合同时检查完整入口、版本和逐文件哈希', () => {
   const report = verifyPackageFiles(fixtureFiles()); assert.equal(report.version, manifest.version); assert.equal(report.apiVersion, 1); assert.ok(report.checks.length >= 7);
 });
-test('发布契约接受当前 DSH 0.2.1-rc.2，拒绝旧版和未验证的目标版本', () => {
-  const report = verifyPackageFiles(fixtureFiles(), { expectedDshVersion: '0.2.1-rc.2' });
-  assert.equal(report.targetDshVersion, '0.2.1-rc.2');
-  for (const expectedDshVersion of ['0.2.0-rc.2', '0.2.1-rc.1', '0.2.1']) {
+test('发布契约接受当前 DSH 0.2.1-rc.3，拒绝旧版和未验证的目标版本', () => {
+  const report = verifyPackageFiles(fixtureFiles(), { expectedDshVersion: '0.2.1-rc.3' });
+  assert.equal(report.targetDshVersion, '0.2.1-rc.3');
+  for (const expectedDshVersion of ['0.2.0-rc.2', '0.2.1-rc.1', '0.2.1-rc.2', '0.2.1-rc.4', '0.2.1']) {
     assert.throws(() => verifyPackageFiles(fixtureFiles(), { expectedDshVersion }), /目标 DSH 应为/);
   }
 });

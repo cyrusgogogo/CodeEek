@@ -9,6 +9,7 @@ import { checkBinding, readRepository } from './filesystem.mjs';
 import { canonicalSelection } from './anchors.mjs';
 import { browseDirectory, viewFile, listAnnotations, createAnnotation, updateAnnotation, selectionPrompt } from './workspace.mjs';
 import { readReadingSettings, setDefaultModel, modelRefSchema } from './preferences.mjs';
+import { createCodeMapRuntime } from './code-map-runtime.mjs';
 import { getStructureMap, refreshStructureMap, updateStructureLayers, inspectStructureFile } from './structure-map.mjs';
 
 export const name = 'code-reading';
@@ -167,7 +168,7 @@ export async function apply(ctx, rawConfig = {}) {
     switch (method) {
       case 'status': {
         requireObject(params, []);
-        return { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, capabilities: ['remove-project', 'default-model', 'structure-map-v1'], dataDirectory: store.root, dataSource, tools: [...TOOL_NAMES] };
+        return { package: PLUGIN_NAME, version: PLUGIN_VERSION, apiVersion: API_VERSION, targetDshVersion: TARGET_DSH_VERSION, enabled: true, capabilities: ['remove-project', 'default-model', 'structure-map-v1', 'code-map-v1'], dataDirectory: store.root, dataSource, tools: [...TOOL_NAMES] };
       }
       case 'reading-settings': requireObject(params, []); return readReadingSettings(store, () => assertActive(signal));
       case 'set-default-model': return setDefaultModel(store, params, () => assertActive(signal), selected => availableReadingModel(selected, () => assertActive(signal)));
@@ -201,7 +202,8 @@ export async function apply(ctx, rawConfig = {}) {
         return { ...await store.snapshot(args.sessionId, args.beforeSeq), running: runtime.busy(args.sessionId), turnEnd: end ? { seq: end.seq, reason: end.data.reason } : null, modelSelection: selection ?? null };
       }
       case 'prompt': {
-        const args = promptSchema.parse(params); store.assertUnarchived(args.sessionId); let preparedText;
+        const args = promptSchema.parse(params); store.assertUnarchived(args.sessionId); codeMaps.assertPrompt(params); let preparedText;
+        await codeMaps.context(args.sessionId); assertPromptCurrent(args.sessionId, promptEpoch, signal);
         if (store.session(args.sessionId).draft || store.session(args.sessionId).nativePending) {
           const current = () => {
             assertPromptCurrent(args.sessionId, promptEpoch, signal); const state = store.assertUnarchived(args.sessionId);
@@ -252,6 +254,7 @@ export async function apply(ctx, rawConfig = {}) {
         if (runtime.busy(args.sessionId)) fail('AGENT_BUSY', '本轮阅读还在进行，请等待或停止后再发送');
         const selected = effectiveModelSelection(currentInspection.events, ctx.get('agentDefaultModel')?.currentSelection() ?? null);
         if (!selected || selected.provider !== args.expectedModel.provider || selected.model !== args.expectedModel.model) fail('MODEL_CHANGED', '本会话实际模型已变化，请刷新确认提供方后重发');
+        codeMaps.assertPrompt(params);
         return ctx.sessionController.prompt({ sessionId: agent.id, requestId: args.requestId, mode: 'queue', content: [{ type: 'text', text }] }, signal);
       }
       case 'stage': {
@@ -279,6 +282,10 @@ export async function apply(ctx, rawConfig = {}) {
         return result;
       }
       case 'reader-state': return store.updateReaderState(params, () => assertActive(signal));
+      case 'code-map': return codeMaps.status(params, signal);
+      case 'code-map-check': return codeMaps.status(params, signal, true);
+      case 'code-map-generate': return codeMaps.generate(params, signal);
+      case 'code-map-cancel': return codeMaps.stop(params, signal);
       case 'structure-map': return getStructureMap(store, params, signal, () => assertActive(signal));
       case 'structure-map-refresh': return refreshStructureMap(store, params, signal, () => assertActive(signal));
       case 'structure-map-layers': return updateStructureLayers(store, params, signal, () => assertActive(signal));
@@ -329,7 +336,7 @@ export async function apply(ctx, rawConfig = {}) {
         return store.setSessionArchived(params, () => { assertActive(signal); if (runtime.busy(id)) fail('AGENT_BUSY', '阅读进行中不能归档或恢复会话，请先停止'); });
       }
       case 'cancel': {
-        const id = onlyId(params); const state = store.session(id);
+        const id = onlyId(params); const state = store.session(id); codeMaps.noteCancel(id);
         runtime.cancelEpochs.set(id, (runtime.cancelEpochs.get(id) ?? 0) + 1);
         if (state.draft || (state.nativePending && !ctx.agents.get(id))) return { cancelled: true, running: false };
         return ctx.sessionController.cancel({ sessionId: id });
@@ -337,6 +344,11 @@ export async function apply(ctx, rawConfig = {}) {
       default: fail('UNKNOWN_METHOD', '不支持此阅读页面操作');
     }
   }
+  const codeMaps = createCodeMapRuntime({ store, current: assertActive, availableModel: availableReadingModel, ensureSession: ensurePendingNativeSession,
+    prompt: (args, signal) => dispatch('prompt', args, signal), inspect: id => ctx.sessionController.inspect(id), busy: id => runtime.busy(id),
+    pending: (id, requestId) => { const inbox = ctx.agents.get(id)?.inbox; return [...(inbox?.nextTurn ?? []), ...(inbox?.nextStep ?? [])].some(message => message.source?.kind === 'user' && message.source.rpcId === requestId); },
+    cancel: id => dispatch('cancel', { sessionId: id }), cancelEpoch: id => runtime.cancelEpochs.get(id) ?? 0 });
+  runtime.codeMaps = codeMaps;
   runtime.dispatch = dispatch;
   await ctx.effect(() => ctx.connection.fetch.register({ path: '/api/code-reading', methods: ['POST'], requestBody: 'buffered', fetch: async request => {
     try {

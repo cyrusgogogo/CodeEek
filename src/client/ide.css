@@ -135,4 +135,39 @@
   .cr-ide .cr-logic-graph { padding:9px; }
   .cr-ide .cr-composer { padding:8px 10px; }
 }
+/* Focus is a document presentation preference, not a new reading state. */
+.cr-workbench.cr-ide { --cr-accent:var(--dsw-alias-brand-primary,#5057c9); --cr-action:var(--cr-accent); --cr-teal:var(--dsw-alias-state-success-primary,#16816a); }
+.cr-workbench.cr-ide .cr-header { min-height:52px; padding:8px 16px; gap:10px; }
+.cr-ide .cr-header > .cr-badge-safe { border:0; background:transparent; padding:0 6px; font-size:11px; color:var(--cr-muted); }
+.cr-ide .cr-focus-tools { display:flex; align-items:center; justify-content:flex-end; gap:5px; margin-left:auto; }
+.cr-page.cr-ide .cr-focus-tools button { display:inline-flex; align-items:center; gap:6px; min-height:32px; padding:5px 10px; border-color:transparent; background:transparent; border-radius:6px; font-size:11px; color:var(--cr-muted); white-space:nowrap; }
+.cr-page.cr-ide .cr-focus-tools .cr-focus-toggle { border-color:var(--cr-border); color:var(--cr-text); }
+.cr-page.cr-ide .cr-focus-tools button:hover { background:var(--cr-raised); }
+.cr-workbench.cr-ide.cr-reading-focus .cr-body { grid-template-columns:minmax(0,1fr); grid-template-areas:"editor"; }
+.cr-workbench.cr-ide.cr-reading-focus .cr-body > :is(.cr-file-sidebar,.cr-reading-sidebar) { display:none; }
+.cr-workbench.cr-ide.cr-reading-focus .cr-editor-main { grid-area:editor; visibility:visible !important; }
+.cr-ide .cr-map-reading-scroll > * { max-width:1280px; }
+.cr-workbench.cr-ide .cr-map-topic-header { border-bottom:0; padding-bottom:0; margin-bottom:20px; }
+.cr-ide .cr-map-topic-header h1 { font-size:clamp(20px,1.8vw,27px); text-wrap:balance; }
+.cr-workbench.cr-ide .cr-lesson-map { margin-top:0; }
+.cr-workbench.cr-ide .cr-lesson-map > details { border:0; border-top:1px solid var(--cr-border); border-radius:0; margin:8px 0; }
+.cr-workbench.cr-ide .cr-lesson-map > details > summary { padding:11px 2px; background:transparent; color:var(--cr-muted); }
+.cr-ide .cr-map-evidence .cr-lesson-evidence { padding:0 12px 12px; }
+.cr-ide .cr-map-notice { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:6px 20px; border-bottom:1px solid var(--cr-border); font-size:11px; color:var(--cr-muted); }
+.cr-ide .cr-map-notice > span::before { content:''; display:inline-block; width:5px; height:5px; border-radius:50%; background:var(--cr-warn); vertical-align:middle; margin-right:8px; }
+.cr-ide .cr-map-notice button { flex:none; padding:3px 7px; border-color:transparent; background:transparent; font-size:11px; color:var(--cr-muted); }
+.cr-ide .cr-composer[data-compact=true] { padding-block:9px; }
+.cr-ide .cr-composer[data-compact=true] .cr-composer-toggle { padding:0; min-height:25px; }
+.cr-ide.cr-reading-focus .cr-composer > * { max-width:1280px; }
+.cr-workbench.cr-ide .cr-primary:hover:not(:disabled) { background:color-mix(in srgb,var(--cr-action) 86%,#000); border-color:var(--cr-action); }
+@media(max-width:600px) {
+  .cr-workbench.cr-ide .cr-header { gap:5px; padding:7px 10px; flex-wrap:wrap; }
+  .cr-ide .cr-app-title,.cr-ide .cr-header > .cr-badge-safe { display:none; }
+  .cr-workbench.cr-ide .cr-project-switch { min-width:90px; max-width:calc(100% - 190px); flex:1; margin-right:0; }
+  .cr-ide .cr-focus-navigation > span { display:none; }
+  .cr-page.cr-ide .cr-focus-tools button { padding:5px 7px; min-height:34px; }
+  .cr-ide .cr-focus-tools { gap:2px; }
+  .cr-ide .cr-project-menu > button { padding:5px 7px; min-height:34px; }
+  .cr-ide .cr-map-notice { padding:5px 10px; gap:5px; }
+}
 @media(prefers-reduced-motion:reduce) { .cr-ide .cr-document-tab,.cr-ide .cr-document-tab-button { transition:none; } }

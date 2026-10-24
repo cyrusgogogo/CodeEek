@@ -6,8 +6,8 @@ import { Config } from '../src/index.mjs';
 import { resolveDataDirectory } from '../src/config.mjs';
 
 const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
-test('安装包精确声明 DSH 0.2.1-rc.2 目标且所有宿主 peer 保持一致', () => {
-  assert.equal(manifest.engines?.dsh, '0.2.1-rc.2');
+test('安装包精确声明 DSH 0.2.1-rc.3 目标且所有宿主 peer 保持一致', () => {
+  assert.equal(manifest.engines?.dsh, '0.2.1-rc.3');
   assert.equal(manifest.dsh.manifestVersion, 1);
   for (const version of Object.values(manifest.peerDependencies)) assert.equal(version, manifest.engines.dsh);
 });

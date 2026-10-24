@@ -9,10 +9,12 @@ import { ReadingSettings } from './settings.jsx';
 import { SourceConsent } from './consent.jsx';
 import { CodeFence } from './code.jsx';
 import { FileWorkspace, FileRail, FileViewer, DocumentTabs } from './reader.jsx';
-import { topicTitle, ReadingRoute, LessonArticle, ReadingDialog, Transcript } from './workbench.jsx';
+import { topicTitle, ReadingRoute, LessonArticle, ReadingDialog, Transcript, isMapLesson } from './workbench.jsx';
 import { UiIcon } from './icons/ui-icons.jsx';
 import { ModelSelect } from './model-select.jsx';
 import { StructureMap } from './structure-map.jsx';
+import { CodeMapConsent, CodeMapOverview, useCodeMap } from './code-map.jsx';
+import codeMapCss from './code-map.css';
 import { mapProjectKey, readerDocumentKind } from './structure-map-state.mjs';
 import structureMapCss from './structure-map.css';
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from './ui/select.jsx';
@@ -21,7 +23,8 @@ import workbenchCss from './workbench.css';
 import selectCss from './ui/select.css';
 import ideCss from './ide.css';
 import codeReadingsCss from './code-readings.css';
-const css = baseCss + '\n' + workbenchCss + '\n' + selectCss + '\n' + ideCss + '\n' + codeReadingsCss + '\n' + structureMapCss;
+import mindMapCss from './mind-map.css';
+const css = baseCss + '\n' + workbenchCss + '\n' + selectCss + '\n' + ideCss + '\n' + codeReadingsCss + '\n' + structureMapCss + '\n' + codeMapCss + '\n' + mindMapCss;
 
 export { renderDiagramDocument, api };
 export const inject = ['slots', 'uiWorkspace'];
@@ -40,7 +43,7 @@ export function Markdown({ text, openEvidence }) {
     pre: MarkdownPre
   }}>{text}</ReactMarkdown></div>;
 }
-function ProjectForm({ workspaces, pickDirectory, onCreate, busy, cancel }) {
+function ProjectForm({ workspaces, pickDirectory, onCreate, busy, cancel, codeMapAvailable }) {
   const [repos, setRepos] = useState([{ path: '' }]);
   const update = (index, value) => setRepos(rows => rows.map((repo, i) => i === index ? { ...repo, path: value } : repo));
   return <section className="cr-empty cr-card cr-open-repository">
@@ -50,7 +53,7 @@ function ProjectForm({ workspaces, pickDirectory, onCreate, busy, cancel }) {
       {workspaces.length > 0 && <label>从 DSH 工作区添加<select value="" onChange={event => { const ws = workspaces.find(item => item.workspaceId === event.target.value); if (ws) setRepos(rows => [...rows.filter(repo => repo.path.trim()), { path: ws.path, workspaceId: ws.workspaceId }]); }}><option value="">选择工作区…</option>{workspaces.map(ws => <option key={ws.workspaceId} value={ws.workspaceId}>{ws.title} — {ws.path}</option>)}</select></label>}
       {repos.map((repo, index) => <div className="cr-repo" key={index}><input aria-label={`仓库 ${index + 1} 目录`} required value={repo.path} onChange={event => update(index, event.target.value)} placeholder="本地仓库绝对路径" /><div className="cr-row"><button type="button" onClick={async () => { const path = await pickDirectory(); if (path) update(index, path); }}>选择目录</button>{repos.length > 1 && <button type="button" aria-label={`移除仓库 ${index + 1}`} onClick={() => setRepos(rows => rows.filter((_, i) => i !== index))}>移除</button>}</div></div>)}
       <div className="cr-row"><button type="button" disabled={repos.length >= 12} onClick={() => setRepos(rows => [...rows, { path: '' }])}>添加仓库</button><button className="cr-primary" disabled={busy} type="submit">打开仓库</button><button type="button" disabled={busy} onClick={cancel}>取消</button></div>
-      <p className="cr-form-note">打开仓库不会调用模型；发送阅读问题前会请你确认源码范围。</p>
+      <p className="cr-form-note">{codeMapAvailable ? '首次打开会请你选择地图模型；确认源码范围后自动生成，可暂不生成。' : '打开仓库不会调用模型；发送阅读问题前会请你确认源码范围。'}</p>
     </form>
   </section>;
 }
@@ -73,14 +76,15 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   const [draft, setDraft] = useState(''); const [entryMode, setEntryMode] = useState('question'); const [activeDocument, setActiveDocument] = useState('empty'); const [readingDocuments, setReadingDocuments] = useState([]); const [composerOpen, setComposerOpen] = useState(false); const [models, setModels] = useState(null); const [model, setModel] = useState('');
   const [repoId, setRepoId] = useState(''); const [waiting, setWaiting] = useState(false); const [accepting, setAccepting] = useState(false); const [cancelPending, setCancelPending] = useState(false); const [history, setHistory] = useState({ sessionId: '', epoch: -1, rows: [] });
   const [connection, setConnection] = useState({ state: 'loading', status: null, error: null }); const [listState, setListState] = useState('loading'); const [snapshotState, setSnapshotState] = useState('idle'); const [modelsState, setModelsState] = useState('loading');
-  const [projectOpen, setProjectOpen] = useState(false); const [removingProject, setRemovingProject] = useState(null); const pendingProjectDialog = useRef(false);
+  const [projectOpen, setProjectOpen] = useState(false); const [removingProject, setRemovingProject] = useState(null); const pendingProjectDialog = useRef(false); const projectTrigger = useRef(null);
   const [dialog, setDialog] = useState(''); const [menuOpen, setMenuOpen] = useState(false); const [routeOpen, setRouteOpen] = useState(true); const [sessionFilter, setSessionFilter] = useState('active'); const [viewStage, setViewStage] = useState('discover'); const [selectedId, setSelectedId] = useState(null);
+  const [focusPreference, setFocusPreference] = useState(null);
   const [viewed, setViewed] = useState([]); const [understood, setUnderstood] = useState([]); const [questionSelection, setQuestionSelection] = useState(null); const [returnPoint, setReturnPoint] = useState(null); const [confirmation, setConfirmation] = useState(null); const [lastFailed, setLastFailed] = useState(null);
   const activeRef = useRef(activeId); activeRef.current = activeId; const viewEpoch = useRef(0); const initializedView = useRef(null); const pendingOperations = useRef(0); const snapshotAbort = useRef(null); const setupAbort = useRef(null); const mounted = useRef(true); const waitingBaseline = useRef(-1); const pendingPrompt = useRef(null);
   const reader = useRef(null); const restorePending = useRef(null); const content = useRef(null); const readerStates = useRef(new Map()); const saveChains = useRef(new Map()); const consent = useRef(null); const navigation = useRef(0); const followResult = useRef(null); const lastAttempt = useRef(null); const submitting = useRef(null); const evidenceSequence = useRef(0); const listSequence = useRef(0); const cancelAcknowledged = useRef(false);
   const draftSessions = useRef(new Set()); const sessionFilters = useRef(null);
-  const [mapTabs, setMapTabs] = useState([]); const [mapReturn, setMapReturn] = useState('');
-  const mapViews = useRef(new Map()); const mapOrigins = useRef(new Map()); const nonMapPositions = useRef(new Map());
+  const [mapTabs, setMapTabs] = useState([]); const [mapReturn, setMapReturn] = useState(''); const mapTabKeys = useRef(mapTabs); mapTabKeys.current = mapTabs;
+  const mapViews = useRef(new Map()); const mapOrigins = useRef(new Map()); const nonMapPositions = useRef(new Map()); const pageRoot = useRef(null); const newlyCreatedProjects = useRef(new Set());
   const selectedLesson = snapshot?.state.lessons.find(lesson => lesson.id === selectedId) ?? null;
   const archived = !!snapshot?.archivedAt;
   const olderMessages = history.sessionId === activeId && history.epoch === viewEpoch.current ? history.rows : [];
@@ -89,6 +93,25 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   const currentProject = snapshot?.project ?? listing.projects.find(project => project.sessions.some(session => session.id === activeId));
   const mapKey = mapProjectKey(currentProject); const mapIsOpen = mapTabs.includes(mapKey);
   const mapAvailable = !!connection.status?.capabilities?.includes('structure-map-v1');
+  const codeMapAvailable = !!connection.status?.capabilities?.includes('code-map-v1');
+  const codeMap = useCodeMap({ project: snapshot?.project ? { ...snapshot.project, codeMapOnboarding: snapshot.project.codeMapOnboarding || newlyCreatedProjects.current.has(snapshot.project.id) } : null, sessionId: activeId, enabled: !!(ready && codeMapAvailable && snapshot && !creating), pageRef: pageRoot, allowOnboarding: !busy && !dialog && !confirmation, onOnboard: () => openMap(), onSettled: () => { void refreshList().catch(() => {}); } });
+  const mapReading = isMapLesson(selectedLesson, snapshot, codeMap.data?.latest ?? snapshot?.codeMap);
+  const focusKey = JSON.stringify([currentProject?.id, activeDocument, activeDocument === 'reading' ? selectedId : '']);
+  const focused = !!snapshot && !creating && (focusPreference?.key === focusKey ? focusPreference.value : activeDocument === 'map' && codeMapAvailable || activeDocument === 'reading' && mapReading);
+  function showNavigation(kind) {
+    setFocusPreference({ key: focusKey, value: false });
+    if (kind === 'files') { setRouteOpen(false); reader.current?.browseFiles(); }
+    else { reader.current?.close(); setRouteOpen(true); }
+    requestAnimationFrame(() => pageRoot.current?.querySelector(kind === 'files' ? '.cr-file-sidebar .cr-extension-header button' : '.cr-route-toolbar button')?.focus({ preventScroll: true }));
+  }
+  useEffect(() => {
+    if (!focused) return;
+    const previous = document.activeElement;
+    if (previous?.closest('.cr-reading-sidebar,.cr-file-sidebar')) {
+      const frame = requestAnimationFrame(() => pageRoot.current?.querySelector('.cr-document-tab[data-active="true"] .cr-document-tab-button')?.focus({ preventScroll: true }));
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [focused, focusKey]);
   const scope = snapshot ? JSON.stringify({ sessionId: activeId, model, bindingRevision: snapshot.project.bindingRevision, repos: snapshot.project.repositories.map(repo => [repo.id, repo.root]) }) : '';
   const requestedDocument = useRef(null);
   const handleController = useCallback(controller => { reader.current = controller; if (controller && restorePending.current) { controller.restorePosition(restorePending.current, { activate: false }); restorePending.current = null; } }, []);
@@ -110,16 +133,20 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
     if (window.matchMedia('(max-width:900px)').matches) reader.current?.close();
   }
   function mapNavigation() { navigation.current++; evidenceSequence.current++; followResult.current = null; }
+  function rememberMapTab(project) {
+    const key = mapProjectKey(project);
+    if (!mapViews.current.has(key)) mapViews.current.set(key, { projectId: project.id });
+    const nextTabs = [...mapTabKeys.current.filter(item => item !== key), key].slice(-12); mapTabKeys.current = nextTabs; setMapTabs(nextTabs);
+    // Both automatic and explicit entry retain metadata for at most twelve tabs.
+    for (const item of mapViews.current.keys()) if (!nextTabs.includes(item)) { mapViews.current.delete(item); mapOrigins.current.delete(item); }
+  }
   function openMap() {
     if (!snapshot || !ready || !mapAvailable) return;
     if (activeDocument !== 'map') {
       mapOrigins.current.set(mapKey, { sessionId: activeId, kind: activeDocument, position: reader.current?.capturePosition() ?? null, selectedId, stage: viewStage, scrollTop: content.current?.scrollTop ?? 0 });
       void savePosition();
     }
-    if (!mapViews.current.has(mapKey)) mapViews.current.set(mapKey, { projectId: snapshot.project.id });
-    const nextTabs = [...mapTabs.filter(key => key !== mapKey), mapKey].slice(-12); setMapTabs(nextTabs);
-    // Metadata-only navigation is bounded to twelve recently opened projects.
-    for (const key of mapViews.current.keys()) if (!nextTabs.includes(key)) { mapViews.current.delete(key); mapOrigins.current.delete(key); }
+    rememberMapTab(snapshot.project);
     mapNavigation(); setCreating(false); setActiveDocument('map'); setMenuOpen(false);
     const nav = navigation.current; const id = activeId;
     requestAnimationFrame(() => { if (mounted.current && activeRef.current === id && navigation.current === nav) content.current?.closest('main')?.querySelector('.cr-document-tab-button[data-document-kind="map"]')?.focus({ preventScroll: true }); });
@@ -147,6 +174,11 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   }
   function openMapSource(location) { mapNavigation(); setMapReturn(mapKey); reader.current?.openLocation(location); }
   function openMapReading(sessionId, lessonId) { mapNavigation(); setMapReturn(mapKey); openReading(sessionId, lessonId); }
+  async function openMapEvidence(sessionId, evidenceId) {
+    const id = activeId; const epoch = viewEpoch.current; const sequence = ++evidenceSequence.current; const route = navigation.current;
+    try { const value = await api('evidence', { sessionId, evidenceId }); if (mounted.current && activeRef.current === id && viewEpoch.current === epoch && sequence === evidenceSequence.current && route === navigation.current) { setMapReturn(mapKey); reader.current?.openEvidence(value); } }
+    catch (e) { if (mounted.current && activeRef.current === id && viewEpoch.current === epoch && sequence === evidenceSequence.current && route === navigation.current) setError(`地图引用无法定位：${e.message}。不会猜测对应源码。`); }
+  }
   function closeReadingDocument(document) {
     setReadingDocuments(rows => rows.filter(row => row.sessionId !== document.sessionId));
     if (document.sessionId === activeId && draftSessions.current.has(document.sessionId)) { setDraft(''); setQuestionSelection(null); setConfirmation(null); setLastFailed(null); }
@@ -200,9 +232,10 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
         setSelectedId(lesson?.id ?? null); setViewStage(lesson?.stage ?? value.stage); setViewed(viewedIds); setUnderstood(state.understoodLessonIds);
         restorePending.current = state.readerPosition;
         const requestedKind = requested?.kind ?? null;
-        const kind = requestedKind ?? state.activeDocument ?? (state.readerPosition ? 'source' : lesson ? 'reading' : 'empty');
+        const kind = requestedKind ?? state.activeDocument ?? (codeMapAvailable && mapAvailable && (value.project.codeMapOnboarding || newlyCreatedProjects.current.has(value.project.id)) ? 'map' : state.readerPosition ? 'source' : lesson ? 'reading' : 'empty');
+        if (kind === 'map') rememberMapTab(value.project);
         requestedDocument.current = null; setActiveDocument(kind); if (kind === 'reading') rememberReadingDocument(id, value.topic, value.project.id);
-        if (requestedKind) void persistReading({ activeDocument: requestedKind, ...(linkedLesson ? { viewStage: linkedLesson.stage, selectedLessonId: linkedLesson.id, viewedLessonIds: viewedIds, lessonScrollTop: 0 } : {}) }, id);
+        if (requestedKind && requestedKind !== 'map') void persistReading({ activeDocument: requestedKind, ...(linkedLesson ? { viewStage: linkedLesson.stage, selectedLessonId: linkedLesson.id, viewedLessonIds: viewedIds, lessonScrollTop: 0 } : {}) }, id);
         if (!value.state.lessons.length && !value.messages.length) setDraft(value.topic || '');
         requestAnimationFrame(() => { if (content.current && activeRef.current === id && viewEpoch.current === epoch) content.current.scrollTop = linkedLesson ? 0 : state.lessonScrollTop ?? 0; });
       } else if (followResult.current?.id === id && followResult.current.navigation === navigation.current) {
@@ -367,6 +400,7 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   }
   async function createProject(request) {
     const current = creationGuard(); const project = await api('create-project', request);
+    if (codeMapAvailable) newlyCreatedProjects.current.add(project.id);
     if (!current()) { await refreshList(); return; }
     setCreating(false); let created;
     try {
@@ -380,19 +414,35 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   const topics = [...(snapshot?.state.lessons ?? [])].reverse().find(lesson => lesson.topics?.length)?.topics ?? [];
   const followText = draft.trim() || `围绕阅读主题「${topicTitle(snapshot?.topic)}」${selectedLesson ? `，接着「${selectedLesson.title}」` : ''}解释下一个相关知识点。按当前问题选择需要的业务背景、调用链或实现逻辑，不要求按固定阶段推进。先取证，发布后等待我决定。`;
   const codeGoal = '请从我选中的代码开始，先识别并完整读取其所属方法或函数，再解释实现逻辑、项目内必要的上下游调用链和相关业务用途。代码解读的最小单元是完整方法、函数或构造器，不能把局部语句冒充完整方法；类或文件问题可按完整的更大代码单元阅读。为每个实际解读的完整代码单元归档可关联源码的结论，区分事实、推断与待确认。非代码文件不受方法粒度约束。';
-  function newReading(project = currentProject) {
+  function switchProject(id) {
+    if (id === 'manage-repositories') { pendingProjectDialog.current = true; return; }
+    const project = listing.projects.find(item => item.id === id);
+    if (!project || !ready || busy) return;
+    if (project.id === currentProject?.id) { setCreating(false); return; }
+    const session = project.sessions.find(item => !item.archivedAt) ?? project.sessions[0];
+    if (session) switchSession(session.id);
+    // Source browsing needs a memory session, not another repository picker or reading form.
+    else newReading(project, { showReading: false });
+  }
+  function newReading(project = currentProject, { showReading = true } = {}) {
     if (!project) { setCreating(true); return; }
     if (window.matchMedia('(max-width:1100px)').matches) setRouteOpen(false);
     if (window.matchMedia('(max-width:900px)').matches) reader.current?.close();
-    if (snapshot?.draft && snapshot.project.id === project.id) { setCreating(false); openReading(); return; }
-    const current = creationGuard();
+    if (snapshot?.draft && snapshot.project.id === project.id) { setCreating(false); if (showReading) openReading(); return; }
+    const current = creationGuard(); let openedId = null;
     void perform(async () => {
       await savePosition(); if (!current()) return;
       const value = await api('create-session', { projectId: project.id, draft: true }); draftSessions.current.add(value.sessionId);
       if (!current()) { discardDraft(value.sessionId); return; }
       try { await refreshList(); } catch (error) { discardDraft(value.sessionId); throw error; }
       if (!current()) { discardDraft(value.sessionId); return; }
-      rememberReadingDocument(value.sessionId, '临时阅读', project.id); requestedDocument.current = { id: value.sessionId, kind: 'reading' }; switchSession(value.sessionId); setSessionFilter('active');
+      if (showReading) { rememberReadingDocument(value.sessionId, '临时阅读', project.id); requestedDocument.current = { id: value.sessionId, kind: 'reading' }; }
+      openedId = value.sessionId; switchSession(openedId); setSessionFilter('active');
+    }).finally(() => {
+      // The picker was disabled while opening; Radix cannot focus a disabled trigger.
+      if (!showReading && (openedId || current())) requestAnimationFrame(() => {
+        if (mounted.current && activeRef.current === (openedId ?? activeId) && document.activeElement === document.body) projectTrigger.current?.focus({ preventScroll: true });
+      });
     });
   }
   async function setSessionArchived(session, shouldArchive) {
@@ -443,15 +493,19 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
   }} />;
   const modelHint = model ? `会话所选模型：${model.replace('\u0000', ' / ')}。实际接收方是该提供方配置的服务端点，并非模型显示名；首次发送前请核对。` : modelsState === 'loading' ? '正在加载模型目录，请稍候。' : modelsState === 'error' ? '模型目录加载失败。请在阅读设置中重新加载。' : models?.groups.some(group => group.models.length) ? '选择本会话的提供方与模型。' : '暂无可用模型。请先在 DSH“设置 → 模型”配置提供方，再在阅读设置中重新加载。';
   const selectionContext = questionSelection && <span className="cr-context-selection" title={`SHA256 ${questionSelection.fileHash}`}>已固定选区：{snapshot?.project.repositories.find(repo => repo.id === questionSelection.repoId)?.name} / {questionSelection.path}:{questionSelection.start.line}–{questionSelection.end.line}<button type="button" aria-label="移除提问选区" onClick={() => setQuestionSelection(null)}>×</button></span>;
-  return <div className={`cr-page cr-workbench cr-ide${routeOpen ? '' : ' cr-route-collapsed'}`} data-testid="code-reading-panel" data-has-project={!!currentProject}>
+  return <div ref={pageRoot} className={`cr-page cr-workbench cr-ide${routeOpen ? '' : ' cr-route-collapsed'}${focused ? ' cr-reading-focus' : ''}`} data-testid="code-reading-panel" data-has-project={!!currentProject} data-reading-focus={focused}>
     <header className="cr-header">
       <span className="cr-brand-icon"><BookIcon size={20} /></span><span className="cr-app-title">阅读代码</span>
-      <div className="cr-project-switch"><Select value={currentProject?.id ?? ''} disabled={busy || !ready || !listing.projects.length} open={projectOpen && !busy && ready && !!listing.projects.length} onOpenChange={setProjectOpen} onValueChange={id => { if (id === 'manage-repositories') { pendingProjectDialog.current = true; return; } const project = listing.projects.find(item => item.id === id); const session = project?.sessions.find(item => !item.archivedAt) ?? project?.sessions[0]; if (session) switchSession(session.id); else { setCreating(false); pendingProjectDialog.current = true; } }}>
-        <SelectTrigger aria-label="阅读项目切换" title={currentProject?.title}><SelectValue placeholder="选择仓库" /></SelectTrigger>
+      <div className="cr-project-switch"><Select value={currentProject?.id ?? ''} disabled={busy || !ready || !listing.projects.length} open={projectOpen && !busy && ready && !!listing.projects.length} onOpenChange={setProjectOpen} onValueChange={switchProject}>
+        <SelectTrigger ref={projectTrigger} aria-label="阅读项目切换" title={currentProject?.title}><SelectValue placeholder="选择仓库" /></SelectTrigger>
         <SelectContent aria-label="阅读项目切换" className="cr-project-options" onCloseAutoFocus={event => { if (pendingProjectDialog.current) { pendingProjectDialog.current = false; event.preventDefault(); setDialog('projects'); } }}>{listing.projects.map(project => <SelectItem key={project.id} value={project.id}>{project.title}</SelectItem>)}<SelectSeparator /><SelectItem value="manage-repositories">管理仓库…</SelectItem></SelectContent>
       </Select></div>
       {currentProject?.repositories.length > 1 && <span className="cr-header-repos" title={currentProject.repositories.map(repo => repo.root).join(' / ')}>{currentProject.repositories.length} 个关联仓库</span>}
       <span className="cr-badge cr-badge-safe">仓库只读</span>
+      {snapshot && !creating && <div className="cr-focus-tools">
+        {focused && <><button type="button" className="cr-focus-navigation" aria-label="文件目录" title="打开文件目录" onClick={() => showNavigation('files')}><UiIcon name="folder-tree" size={15} /><span>文件目录</span></button><button type="button" className="cr-focus-navigation" aria-label="阅读列表" title="打开阅读列表" onClick={() => showNavigation('readings')}><UiIcon name="files" size={15} /><span>阅读列表</span></button></>}
+        <button type="button" className="cr-focus-toggle" aria-pressed={focused} onClick={() => setFocusPreference({ key: focusKey, value: !focused })}>{focused ? '退出专注' : '专注阅读'}</button>
+      </div>}
       <div className="cr-project-menu"><button type="button" aria-label="阅读菜单" aria-expanded={menuOpen} aria-controls="cr-project-actions" onClick={() => setMenuOpen(value => !value)}>更多 <span aria-hidden="true">···</span></button>{menuOpen && <div id="cr-project-actions" className="cr-menu">
         <button type="button" disabled={busy || !ready} onClick={() => { setMenuOpen(false); newReading(); }}>新建阅读</button>
         <button type="button" disabled={!snapshot || !ready || !mapAvailable} title={mapAvailable ? '查看项目结构，不会请求模型' : '当前 Host 尚不支持项目地图，请核对插件版本'} onClick={openMap}>项目地图</button>
@@ -475,20 +529,21 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
             {archived && <div className="cr-banner cr-archived-notice" role="status">这条阅读已归档。内容、证据和位置均保留，恢复后可继续提问。<button type="button" disabled={busy || running} onClick={() => void perform(() => setSessionArchived(snapshot, false))}>恢复阅读</button></div>}
             {snapshot?.archiveError && <div className="cr-banner cr-error" role="alert">归档失败：{snapshot.archiveError}。DSH 原会话仍是恢复来源，请刷新重试。</div>}
             {snapshot && snapshotState === 'error' && <div className="cr-banner cr-error" role="alert">状态刷新失败，已完成内容保留。运行是否结束尚未确认。<button type="button" disabled={busy} onClick={() => void perform(() => refresh())}>重新加载档案</button></div>}
+            {snapshot && !creating && codeMapAvailable && activeDocument !== 'map' && (codeMap.data?.changes?.changed || codeMap.data?.changes?.truncated || codeMap.data?.changes?.uncertain?.length || codeMap.data?.task?.status === 'running' || codeMap.problem) && <div className="cr-map-notice" role="status"><span>{codeMap.problem ? '地图状态需核对' : codeMap.data?.task?.status === 'running' ? '代码地图正在生成' : codeMap.data?.changes?.changed ? '本地代码有变化 · 地图待更新' : '本地检测不完整 · 地图待复核'}</span><button type="button" onClick={openMap}>查看代码地图</button></div>}
             {running && snapshot && <section className="cr-editor-task" role="status"><span className="cr-indeterminate" aria-hidden="true" /><span>{cancelPending ? '停止请求已提交，等待后端结束' : accepting ? '等待后端接纳本轮问题' : '正在分析本轮问题'}<small>代码与已有阅读内容仍可浏览</small></span><button type="button" disabled={cancelPending} onClick={() => void perform(stopAnalysis)}>{cancelPending ? '等待停止确认' : '停止分析'}</button></section>}
           </div>
           {snapshot && !creating && mapIsOpen && mapReturn === mapKey && activeDocument !== 'map' && <div className="cr-map-return"><span>项目地图位置已保留</span><button type="button" onClick={openMap}>返回项目地图</button></div>}
-          {snapshot && !creating && mapIsOpen && mapViews.current.has(mapKey) && <StructureMap key={mapKey} project={snapshot.project} sessionId={activeId} enabled={ready && mapAvailable} active={activeDocument === 'map'} memory={mapViews.current.get(mapKey)} onNavigate={mapNavigation} onOpenSource={openMapSource} onOpenReading={openMapReading} onReturnDocument={returnFromMap} />}
+          {snapshot && !creating && mapIsOpen && mapViews.current.has(mapKey) && <StructureMap key={mapKey} project={snapshot.project} sessionId={activeId} enabled={ready && mapAvailable} active={activeDocument === 'map'} memory={mapViews.current.get(mapKey)} onNavigate={mapNavigation} onOpenSource={openMapSource} onOpenReading={openMapReading} onReturnDocument={returnFromMap} overview={codeMapAvailable ? <CodeMapOverview map={codeMap} Markdown={Markdown} onOpenReading={openMapReading} onOpenEvidence={openMapEvidence} /> : null} />}
           <div className="cr-editor-source cr-source-document" hidden={!snapshot || creating || activeDocument !== 'source'}><FileViewer /></div>
           {snapshot && !creating && activeDocument === 'empty' && <section className="cr-editor-empty" aria-label="代码工作区空态"><span className="cr-editor-empty-symbol"><UiIcon name="file-code-2" size={38} /></span><h1>选择文件，开始阅读</h1></section>}
-          <div className="cr-reading-scroll" ref={content} hidden={!!(snapshot && !creating && activeDocument !== 'reading')}>
+          <div className={`cr-reading-scroll${mapReading ? ' cr-map-reading-scroll' : ''}`} ref={content} hidden={!!(snapshot && !creating && activeDocument !== 'reading')}>
             {connection.state !== 'ready' && <InstallationHelp connection={connection} modelsState={modelsState} models={models} />}
             {!ready ? <section className="cr-empty"><h2>{connection.state === 'loading' || listState === 'loading' ? '正在连接阅读插件' : '阅读项目暂不可用'}</h2><p role="status">{connection.state === 'loading' || listState === 'loading' ? '正在检查连接与仓库，不会请求模型。' : '请检查安装与连接后重试。已有记录不会因此删除。'}</p><button type="button" disabled={busy} onClick={() => void perform(loadSetup)}>重试连接与加载</button></section>
-              : creating ? <ProjectForm workspaces={workspaces ?? []} pickDirectory={async () => { try { return await pickDirectory(); } catch (e) { setError(e.message); return null; } }} onCreate={request => void perform(() => createProject(request))} busy={busy} cancel={() => setCreating(false)} />
+              : creating ? <ProjectForm codeMapAvailable={codeMapAvailable} workspaces={workspaces ?? []} pickDirectory={async () => { try { return await pickDirectory(); } catch (e) { setError(e.message); return null; } }} onCreate={request => void perform(() => createProject(request))} busy={busy} cancel={() => setCreating(false)} />
                 : !activeId ? <section className="cr-empty cr-welcome"><span className="cr-start-symbol"><BookIcon size={28} /></span><h1>从一个问题，<br />或一段代码开始</h1><p>理解业务，追踪调用，读懂实现。<br />不必走固定流程，只专注你这次想弄明白的事。</p><button className="cr-primary" type="button" onClick={() => setCreating(true)}><UiIcon name="folder-tree" size={16} />打开本地仓库</button><div className="cr-welcome-notes"><span><UiIcon name="shield-check" size={15} />源码只读</span><span><UiIcon name="files" size={15} />阅读记录随时回看</span></div></section>
                   : !snapshot && snapshotState === 'error' ? <section className="cr-empty"><h2>阅读档案加载失败</h2><p>档案没有被删除；重试只读取状态，不会重新发送问题。</p><button type="button" disabled={busy} onClick={() => void perform(() => refresh())}>重新加载档案</button></section>
                     : !snapshot ? <p role="status">正在加载阅读档案…</p> : <>
-                      <header className="cr-topic-header"><div className="cr-breadcrumb"><UiIcon name="folder-tree" size={13} />{snapshot.project.repositories.map(repo => repo.name).join(' / ')}<span>/</span>{hasStarted ? '阅读记录' : '开始探索'}</div><div className="cr-topic-title"><h1 tabIndex={-1}>{topicTitle(snapshot.topic, snapshot.project.title)}</h1>{hasStarted && <button type="button" aria-label="浏览源码" onClick={() => reader.current?.browseFiles()}><UiIcon name="file-code-2" size={15} />源码</button>}</div>{hasStarted && <p className="cr-reading-meta">{snapshot.readingMode === 'code' ? '聚焦代码与上下游' : '围绕你的问题'}<span>·</span>{snapshot.state.lessons.length} 个知识点</p>}</header>
+                      <header className={`cr-topic-header${mapReading ? ' cr-map-topic-header' : ''}`}><div className="cr-breadcrumb"><UiIcon name="folder-tree" size={13} />{snapshot.project.repositories.map(repo => repo.name).join(' / ')}<span>/</span>{mapReading ? '代码地图' : hasStarted ? '阅读记录' : '开始探索'}</div><div className="cr-topic-title"><h1 tabIndex={-1}>{mapReading ? selectedLesson.title : topicTitle(snapshot.topic, snapshot.project.title)}</h1>{hasStarted && <button type="button" aria-label="浏览源码" onClick={() => focused ? showNavigation('files') : reader.current?.browseFiles()}><UiIcon name="file-code-2" size={15} />源码</button>}</div>{hasStarted && !mapReading && <p className="cr-reading-meta">{snapshot.readingMode === 'code' ? '聚焦代码与上下游' : '围绕你的问题'}<span>·</span>{snapshot.state.lessons.length} 个知识点</p>}</header>
 
                       {returnPoint && <div className="cr-return-bar"><span>原阅读位置已保留</span><button type="button" onClick={returnToRoute}>返回原阅读路线</button></div>}
                       {!hasStarted && !archived ? <section className="cr-start">
@@ -502,21 +557,21 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
                         </form>}
                         {activeDocument === 'reading' && entryMode === 'code' && !questionSelection && <div className="cr-code-model">{modelPicker}</div>}
                         <p id="cr-model-hint" className={model ? 'cr-sr-only' : 'cr-muted'} role="status">{modelHint}</p><div className="cr-start-footnote"><span id="cr-privacy"><UiIcon name="shield-check" size={13} />源码只读，发送前确认范围</span><button className="cr-text-button" type="button" onClick={() => setDialog('settings')}>阅读设置</button></div>
-                      </section> : selectedLesson ? <LessonArticle key={selectedLesson.id} lesson={selectedLesson} evidence={snapshot.state.evidence} repositories={snapshot.project.repositories} Markdown={Markdown} openEvidence={openEvidence} understood={understood.includes(selectedLesson.id)} onUnderstand={toggleUnderstanding} onDeepen={deepen} disabled={busy || running || archived} /> : !running && <section className="cr-result-empty"><UiIcon name="message-square-text" size={24} /><h2>还没有生成阅读内容</h2><p className="cr-muted">{archived ? '这是已归档的空阅读记录。需要继续时可先恢复。' : '可以调整下面的问题后重试。原问题和已保存的位置都还在。'}</p></section>}
+                      </section> : selectedLesson ? <LessonArticle key={selectedLesson.id} lesson={selectedLesson} mapFirst={mapReading} evidence={snapshot.state.evidence} repositories={snapshot.project.repositories} Markdown={Markdown} openEvidence={openEvidence} understood={understood.includes(selectedLesson.id)} onUnderstand={toggleUnderstanding} onDeepen={deepen} disabled={busy || running || archived} /> : !running && <section className="cr-result-empty"><UiIcon name="message-square-text" size={24} /><h2>还没有生成阅读内容</h2><p className="cr-muted">{archived ? '这是已归档的空阅读记录。需要继续时可先恢复。' : '可以调整下面的问题后重试。原问题和已保存的位置都还在。'}</p></section>}
                       {hasStarted && topics.length > 0 && <details className="cr-topic-candidates"><summary>还可以了解 · {topics.length}</summary>{topics.map((item, index) => <button className="cr-question" type="button" key={index} disabled={busy || running || archived} onClick={() => deepen(item.title)}><strong>{item.title}</strong><small>{item.description}</small></button>)}</details>}
                       {hasStarted && <details className="cr-inline-transcript"><summary>历史追问与对话记录</summary><p className="cr-muted">{selectedLesson?.turn !== undefined ? '以下仅展示与此知识点同一轮的归档消息。' : '旧记录没有可靠的父知识点关联，保留为会话记录，不推断关联。'}</p><Transcript messages={[...olderMessages, ...snapshot.messages].filter(message => selectedLesson?.turn === undefined || message.turn === selectedLesson.turn)} Markdown={Markdown} openEvidence={openEvidence} /><button type="button" onClick={() => setDialog('messages')}>对话记录</button></details>}
                     </>}
           </div>
-          {snapshot && !creating && hasStarted && !archived && activeDocument === 'reading' && <section className="cr-composer">
+          {snapshot && !creating && hasStarted && !archived && activeDocument === 'reading' && <section className="cr-composer" data-compact={mapReading && !composerOpen}>
             <button className="cr-composer-toggle" type="button" aria-expanded={composerOpen} onClick={() => setComposerOpen(value => !value)}><UiIcon name="message-square-text" size={15} />追问当前知识点<span aria-hidden="true">{composerOpen ? '−' : '+'}</span></button>
             <div className="cr-composer-input" hidden={!composerOpen}>
             {questionSelection && <div className="cr-context" aria-label="本次提问上下文">{selectionContext}</div>}
             <label htmlFor="cr-question">追问当前知识点</label><textarea id="cr-question" aria-label="追问当前知识点" value={draft} onChange={event => setDraft(event.target.value)} maxLength={15000} rows={2} placeholder="继续追问，或选择一段代码深入…" disabled={running} onKeyDown={event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); requestPrompt(followText); } }} />
             </div>
-            <div className="cr-composer-actions"><div className="cr-model-compact">{modelPicker}<button type="button" aria-label="阅读设置" onClick={() => setDialog('settings')}>设置</button></div>{!running && <button className="cr-primary" type="button" disabled={busy || !model || snapshotState === 'error'} onClick={() => requestPrompt(followText)}>{draft.trim() ? '发送问题' : '继续阅读'}<UiIcon name="chevron-right" size={14} /></button>}</div>
+            <div className="cr-composer-actions" hidden={mapReading && !composerOpen}><div className="cr-model-compact">{modelPicker}<button type="button" aria-label="阅读设置" onClick={() => setDialog('settings')}>设置</button></div>{!running && <button className="cr-primary" type="button" disabled={busy || !model || snapshotState === 'error'} onClick={() => requestPrompt(followText)}>{draft.trim() ? '发送问题' : '继续阅读'}<UiIcon name="chevron-right" size={14} /></button>}</div>
             <p id="cr-model-hint" className="cr-sr-only">{modelHint}</p><p id="cr-privacy" className="cr-sr-only">源码与问题可能发送至所选提供方配置的服务端点，首次调用或范围变化需确认。</p>{lastFailed && !running && <button type="button" className="cr-retry" disabled={busy} onClick={() => requestPrompt(lastFailed.text, lastFailed.selection, lastFailed.initial, lastFailed.stage, lastFailed)}>重试本次分析</button>}
           </section>}
-          {snapshot && !creating && (activeDocument !== 'reading' || snapshot.draft) && <footer className="cr-editor-statusbar" aria-label="阅读状态栏">{activeDocument !== 'reading' && activeDocument !== 'map' && <><span className="cr-editor-readonly"><UiIcon name="shield-check" size={13} />只读</span><div className="cr-editor-model">{modelPicker}</div></>}{snapshot.draft && <span className="cr-draft-notice" role="status">临时阅读，开始前不会保存到阅读列表。关闭或离开不会留下空记录；确认发起分析或保存人工批注时才保留。</span>}{activeDocument !== 'reading' && <>{!mapIsOpen && <button type="button" className="cr-text-button" disabled={!ready || !mapAvailable} onClick={openMap}>项目地图</button>}<button type="button" className="cr-text-button" onClick={() => setDialog('settings')}>阅读设置</button><button type="button" className="cr-text-button" onClick={() => openReading()}>问题阅读</button></>}</footer>}
+          {snapshot && !creating && (activeDocument !== 'reading' || snapshot.draft) && <footer className="cr-editor-statusbar" aria-label="阅读状态栏">{activeDocument !== 'reading' && activeDocument !== 'map' && <><span className="cr-editor-readonly"><UiIcon name="shield-check" size={13} />只读</span><div className="cr-editor-model">{modelPicker}</div></>}{snapshot.draft && <span className="cr-draft-notice" role="status">临时阅读，开始前不会保存到阅读列表。关闭或离开不会留下空记录；确认发起分析或保存人工批注时才保留。</span>}{activeDocument !== 'reading' && <>{!mapIsOpen && <button type="button" className="cr-text-button" disabled={!ready || !mapAvailable} onClick={openMap}>项目地图</button>}{activeDocument !== 'map' && <button type="button" className="cr-text-button" onClick={() => setDialog('settings')}>阅读设置</button>}<button type="button" className="cr-text-button" onClick={() => openReading()}>问题阅读</button></>}</footer>}
         </main>
       <aside className="cr-projects cr-route cr-reading-sidebar" aria-label="阅读列表">
         <div className="cr-route-toolbar"><strong>阅读列表</strong><button type="button" aria-label={routeOpen ? '收起列表' : '展开列表'} title={routeOpen ? '收起列表' : '展开列表'} aria-expanded={routeOpen} onClick={() => setRouteOpen(value => !value)}><UiIcon name={routeOpen ? 'chevron-right' : 'chevron-left'} /></button></div>
@@ -546,6 +601,7 @@ export function ReadingPanel({ useWorkspaces, pickDirectory }) {
       </aside>
       </FileWorkspace>
     </div>
+    {codeMap.dialog && snapshot && <CodeMapConsent key={`${activeId}:${codeMap.dialog.revision}`} map={codeMap} project={snapshot.project} models={models} modelsState={modelsState} refreshModels={refreshModels} />}
     {confirmation && <SourceConsent model={model} repositories={snapshot?.project.repositories ?? []} selection={confirmation.selection} onClose={() => setConfirmation(null)} onConfirm={() => { const request = confirmation; setConfirmation(null); if (request.scope !== scope || request.sessionId !== activeRef.current) { setError('模型或主题已经变化，请重新确认。'); return; } consent.current = scope; void perform(() => dispatchPrompt(request.text, request.selection, request.initial, request.stage, request.retryAttempt, request.intent)); }} />}
     {dialog && <ReadingDialog key={dialog} className={dialog === 'settings' ? 'cr-settings-dialog' : ''} title={{ settings: '阅读设置', artifacts: '阅读产物', messages: '对话记录', help: '安装与使用', projects: '阅读仓库', 'remove-project': '删除仓库' }[dialog]} onClose={() => { if (dialog !== 'remove-project' || !busy) { setRemovingProject(null); setDialog(''); } }}>
       {dialog === 'help' && <InstallationHelp connection={connection} modelsState={modelsState} models={models} />}

@@ -9,6 +9,7 @@ import { loadAnnotations } from './workspace.mjs';
 import { annotationMarkdown } from './anchors.mjs';
 import { parseReadingFocus, restoredCodeUnits, verifyCodeUnits, codeUnitsMarkdown } from './code-units.mjs';
 import { modelRefSchema } from './preferences.mjs';
+const mapTaskSchema = z.object({ requestId: z.string().uuid() }).strict();
 const makeId = prefix => `${prefix}-${randomUUID()}`;
 const clone = value => structuredClone(value);
 const json = value => `${JSON.stringify(value, null, 2)}\n`;
@@ -45,6 +46,7 @@ export class ReadingStore {
           const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
           if (state.id !== folder.name || state.projectId !== project.id || !Number.isSafeInteger(state.revision) || !Array.isArray(state.evidence) || !Array.isArray(state.lessons) || !Array.isArray(state.messageRefs)) fail('CORRUPT_SESSION', '阅读会话档案无效');
           state.draft = false;
+          if (state.codeMapTask !== undefined) state.codeMapTask = mapTaskSchema.parse(state.codeMapTask);
           state.archivedAt = typeof state.archivedAt === 'string' && Number.isFinite(Date.parse(state.archivedAt)) ? state.archivedAt : null;
           state.archiveRevision = Number.isSafeInteger(state.archiveRevision) && state.archiveRevision >= 0 ? state.archiveRevision : 0;
           state.readerState = this.restoredReaderState(state);
@@ -156,7 +158,7 @@ export class ReadingStore {
         for (const previous of repositories) if (contains(previous.root, binding.root) || contains(binding.root, previous.root)) fail('DUPLICATE_REPOSITORY', '同一个阅读项目中的仓库必须互不嵌套且不能重复');
         repositories.push({ id: makeId('repo'), name: input.name || directoryName(binding.root, 60), ...binding, ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}) });
       }
-      const project = { id: makeId('project'), title: request.title || directoryName(repositories[0].root, 120), createdAt: new Date().toISOString(), bindingRevision: 1, repositories };
+      const project = { id: makeId('project'), title: request.title || directoryName(repositories[0].root, 120), createdAt: new Date().toISOString(), bindingRevision: 1, codeMapOnboarding: true, repositories };
       const dir = this.projectDir(project.id); await this.writable(dir);
       await ensurePlainDirectory(path.join(dir, 'sessions')); await atomicText(path.join(dir, 'project.json'), json(project));
       this.projects.set(project.id, project); return clone(project);
@@ -174,7 +176,7 @@ export class ReadingStore {
       const current = () => { guard?.(); if (ids.some(id => busy(id))) fail('AGENT_BUSY', '此仓库仍有阅读正在进行，请先停止或等待结束后再移除'); };
       current();
       // Serialize with session creation, prompt admission, and all in-flight store writes.
-      const keys = [...ids.map(id => `admission:${id}`), ...ids];
+      const keys = [...ids.map(id => `admission:${id}`), ...ids, `code-map:${project.id}`];
       const locked = index => index === keys.length ? commit() : this.lock(keys[index], () => locked(index + 1));
       const commit = async () => {
         current(); const next = { ...clone(project), removedAt: new Date().toISOString() }; const dir = this.projectDir(project.id);
@@ -188,14 +190,15 @@ export class ReadingStore {
       return locked(0);
     }));
   }
-  async createSession(projectId, { draft = false, modelSelection = null, modelSelectionManaged = false } = {}, guard) {
+  async createSession(projectId, { draft = false, modelSelection = null, modelSelectionManaged = false, codeMapTask = null } = {}, guard) {
     z.boolean().parse(draft); z.boolean().parse(modelSelectionManaged);
+    if (codeMapTask) codeMapTask = mapTaskSchema.parse(codeMapTask);
     if (modelSelectionManaged) modelSelection = modelRefSchema.parse(modelSelection);
     return this.lock('sessions', async () => {
       guard?.(); const project = this.project(projectId); for (const repo of project.repositories) { await checkBinding(repo); guard?.(); }
       const drafts = [...this.sessions.values()].filter(state => state.draft);
       if (draft && drafts.length >= 100) { const oldest = drafts[0].id; this.sessions.delete(oldest); this.draftReadAudits.delete(oldest); this.archiveErrors.delete(oldest); }
-      const state = { id: makeId('reading'), projectId, draft, archivedAt: null, archiveRevision: 0, ...(draft ? { draftModelSelection: clone(modelSelection) } : {}), ...(modelSelectionManaged ? { modelSelectionManaged: true, ...(!draft ? { nativePending: true, pendingNativeModel: clone(modelSelection) } : {}) } : {}), revision: 1, stage: 'discover', topic: '', readingMode: 'question', readingModeRevision: 0, intent: 'explain', readingFocus: null, readerState: readerStateSchema.parse({}), createdAt: new Date().toISOString(), evidence: [], lessons: [], messageRefs: [], archiveSeq: -1, stageHistory: [{ revision: 1, stage: 'discover', topic: '', time: new Date().toISOString() }], publishReceipts: {} };
+      const state = { id: makeId('reading'), projectId, ...(codeMapTask ? { codeMapTask: clone(codeMapTask) } : {}), draft, archivedAt: null, archiveRevision: 0, ...(draft ? { draftModelSelection: clone(modelSelection) } : {}), ...(modelSelectionManaged ? { modelSelectionManaged: true, ...(!draft ? { nativePending: true, pendingNativeModel: clone(modelSelection) } : {}) } : {}), revision: 1, stage: 'discover', topic: '', readingMode: 'question', readingModeRevision: 0, intent: 'explain', readingFocus: null, readerState: readerStateSchema.parse({}), createdAt: new Date().toISOString(), evidence: [], lessons: [], messageRefs: [], archiveSeq: -1, stageHistory: [{ revision: 1, stage: 'discover', topic: '', time: new Date().toISOString() }], publishReceipts: {} };
       guard?.(); this.sessions.set(state.id, state);
       if (draft) return clone(state);
       try { for (const dir of ['', 'notes', 'diagrams', 'messages', 'exports']) { guard?.(); await this.writable(path.join(this.sessionDir(state.id), dir)); } await this.saveState(state, guard); await this.audit(state.id, 'session-created', { bindingRevision: project.bindingRevision }); return clone(state); } catch (error) { this.sessions.delete(state.id); throw error; }
@@ -243,7 +246,7 @@ export class ReadingStore {
     });
   }
   list() { return { root: this.root, diagnostics: [...this.diagnostics], projects: [...this.projects.values()].filter(p => !p.removedAt).map(p => ({ ...clone(p), sessions: [...this.sessions.values()].filter(s => s.projectId === p.id && !s.draft).map(s => ({ id: s.id, draft: false, archivedAt: s.archivedAt ?? null, archiveRevision: s.archiveRevision ?? 0, stage: s.stage, topic: s.topic, readingMode: s.readingMode ?? 'question', intent: s.intent ?? 'explain', createdAt: s.createdAt, revision: s.revision })) })) }; }
-  catalog(id) { const state = this.session(id); return { sessionId: id, draft: !!state.draft, archivedAt: state.archivedAt ?? null, archiveRevision: state.archiveRevision ?? 0, project: clone(this.project(state.projectId)), stage: state.stage, topic: state.topic, revision: state.revision, readingMode: state.readingMode ?? 'question', readingModeRevision: state.readingModeRevision ?? 0, intent: state.intent ?? 'explain', readingFocus: clone(state.readingFocus ?? null), outputDirectory: this.sessionDir(id), limits: { fileBytes: 1048576, evidence: 500, lessons: 100 }, instructions: '每次显式指定 repoId。readingMode 是阅读起点，本轮明确意图优先；选区始终从 code 阅读开始。intent 仅标识本轮：logic-graph 必须围绕当前已核验选区生成有证据的逻辑图，explain 不强制绘图。代码归档 codeUnits 最少完整方法/函数，必要时完整类或整文件；先连续读取完整范围，保留 UTF16 start/end 排他坐标、哈希、结论和覆盖证据。本轮 readingFocus 若为代码须被单元完整包含，不可因 claims 漏写选区而跳过。语义边界由 AI 据语言识别，Host 只核验字节/坐标/证据覆盖，非通用 AST。明确文档/数据路径可豁免；未知扩展仍按代码。stage 仅保留兼容状态；五个维度按问题需要组合，没有固定顺序。discover 仅用于模糊宽泛目标，verify 仅用户明确要求时使用；发布一个知识点后等待用户。' }; }
+  catalog(id) { const state = this.session(id); return { sessionId: id, ...(this.codeMapContexts?.has(state.projectId) ? { codeMap: clone(this.codeMapContexts.get(state.projectId)) } : {}), ...(state.codeMapTask ? { codeMapTask: clone(state.codeMapTask) } : {}), draft: !!state.draft, archivedAt: state.archivedAt ?? null, archiveRevision: state.archiveRevision ?? 0, project: clone(this.project(state.projectId)), stage: state.stage, topic: state.topic, revision: state.revision, readingMode: state.readingMode ?? 'question', readingModeRevision: state.readingModeRevision ?? 0, intent: state.intent ?? 'explain', readingFocus: clone(state.readingFocus ?? null), outputDirectory: this.sessionDir(id), limits: { fileBytes: 1048576, evidence: 500, lessons: 100 }, instructions: '每次显式指定 repoId。readingMode 是阅读起点，本轮明确意图优先；选区始终从 code 阅读开始。intent 仅标识本轮：logic-graph 必须围绕当前已核验选区生成有证据的逻辑图，explain 不强制绘图。代码归档 codeUnits 最少完整方法/函数，必要时完整类或整文件；先连续读取完整范围，保留 UTF16 start/end 排他坐标、哈希、结论和覆盖证据。本轮 readingFocus 若为代码须被单元完整包含，不可因 claims 漏写选区而跳过。语义边界由 AI 据语言识别，Host 只核验字节/坐标/证据覆盖，非通用 AST。明确文档/数据路径可豁免；未知扩展仍按代码。stage 仅保留兼容状态；五个维度按问题需要组合，没有固定顺序。discover 仅用于模糊宽泛目标，verify 仅用户明确要求时使用；发布一个知识点后等待用户。' }; }
   async read(id, raw, signal) {
     const args = readSchema.parse(raw);
     return this.lock(id, async () => {
@@ -299,10 +302,10 @@ export class ReadingStore {
     try { const result = await readRepository(this.repo(id, evidence.repoId), evidence.path); return { evidence: clone(evidence), stale: result.hash !== evidence.hash, currentHash: result.hash, lines: result.lines.slice(evidence.startLine - 1, evidence.endLine).map((text, i) => ({ number: evidence.startLine + i, text })) }; } catch (error) { return { evidence: clone(evidence), stale: true, reason: error.code ?? error.message, lines: [] }; }
   }
   async openEvidence(id, evidenceId) { return this.lock(id, async () => { const result = await this.evidenceStatus(id, evidenceId); await this.audit(id, 'evidence-opened', { evidenceId, stale: result.stale, ...(result.currentHash ? { currentHash: result.currentHash } : {}) }); return result; }); }
-  async publish(id, raw, receipt, turn) {
+  async publish(id, raw, receipt, turn, guard) {
     const args = publishSchema.parse(raw); const mermaid = validateMermaid(args.mermaid);
     return this.lock(id, async () => {
-      this.assertPersisted(id); const state = clone(this.assertUnarchived(id));
+      guard?.(); this.assertPersisted(id); const state = clone(this.assertUnarchived(id));
       // Empty additive defaults must not change old publication receipt bytes.
       const { sections, codeUnits, ...legacyPayload } = args;
       const payloadHash = digest(JSON.stringify({ ...legacyPayload, ...(sections.length ? { sections } : {}), ...(codeUnits.length ? { codeUnits } : {}) }));
@@ -319,6 +322,7 @@ export class ReadingStore {
       if (state.lessons.length >= 100) fail('LESSON_LIMIT', '此会话已有 100 个知识点，请新建阅读会话');
       if (turn !== undefined && state.lessons.some(l => l.turn === turn)) fail('ONE_TOPIC_PER_TURN', '每轮只保存一个知识点，等待用户后继续');
       const refs = [...new Set([...args.claims.flatMap(c => c.evidenceIds), ...args.topics.flatMap(t => t.evidenceIds), ...codeUnits.flatMap(unit => unit.evidenceIds)])];
+      if (state.codeMapTask && !state.lessons.length && !refs.length) fail('CODE_MAP_EVIDENCE_REQUIRED', '代码地图需要实际读取的证据，不能只以假设标记生成完成');
       if (refs.length > 40) fail('LESSON_EVIDENCE_LIMIT', '一个知识点最多引用 40 条证据，请拆成下一轮');
       for (const evidenceId of refs) { const status = await this.evidenceStatus(id, evidenceId); if (status.stale) fail('STALE_EVIDENCE', '代码已变动或无法读取，重新取证后再发布'); }
       const verifiedUnits = await verifyCodeUnits(this, state, codeUnits, refs);
@@ -333,14 +337,14 @@ export class ReadingStore {
           // Never overwrite or later clean up a preexisting file, even on a UUID collision.
           try { await fs.lstat(file); fail('OUTPUT_EXISTS', '逻辑图产物路径已存在，拒绝覆盖'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
         }
-        await atomicText(file, text, max);
+        await atomicText(file, text, max, guard);
         if (graph) written.push({ file: path.resolve(file), stat: await fs.lstat(file) });
       };
       try {
         await this.writable(path.join(dir, 'notes')); await writeArtifact(path.join(dir, 'notes', `${lesson.id}.md`), note, 1048576);
         if (mermaid) { await this.writable(path.join(dir, 'diagrams')); await writeArtifact(path.join(dir, 'diagrams', `${lesson.id}.mmd`), `${mermaid}\n`, 20000); }
         await this.audit(id, graph ? 'lesson-publish-attempt' : 'lesson-published', { lessonId: lesson.id, stage: state.stage, revision: state.revision, evidenceIds: refs });
-        state.lessons.push(lesson); if (receipt) state.publishReceipts[receipt] = { lessonId: lesson.id, payloadHash }; await this.saveState(state); return clone(lesson);
+        state.lessons.push(lesson); if (receipt) state.publishReceipts[receipt] = { lessonId: lesson.id, payloadHash }; await this.saveState(state, guard); return clone(lesson);
       } catch (error) {
         const committed = this.session(id);
         if (graph && !committed.lessons.some(item => item.id === lesson.id) && !Object.values(committed.publishReceipts).some(item => item.lessonId === lesson.id)) {
