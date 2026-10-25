@@ -2,11 +2,7 @@ name: Release plugin
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-    paths:
-      - package.json
-      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:
