@@ -320,7 +320,17 @@ export async function verifyFileWorkspace({ browser, output, plugin, bootstrap }
     assert.equal(await viewer.locator('[data-code-line]').first().getAttribute('data-code-line'), '1', 'file tabs re-read the whole version and restore local scrolling, never a page window');
     partialView = true; const partialBefore = apiCalls.filter(row => row.method === 'view-file').length; await viewer.getByRole('button', { name: '重新加载文件', exact: true }).click(); await viewer.getByRole('alert').filter({ hasText: '不会拼接分页' }).waitFor();
     assert.equal(await viewer.locator('[data-code-line]').count(), 0, 'an incomplete response is rejected rather than displayed as a full snapshot'); assert.equal(apiCalls.filter(row => row.method === 'view-file').length, partialBefore + 1, 'a partial response cannot trigger page-stitching requests');
-    partialView = 'over-lines'; const overLinesBefore = apiCalls.filter(row => row.method === 'view-file').length; await viewer.getByRole('button', { name: '重新加载文件', exact: true }).click(); await viewer.getByRole('alert').filter({ hasText: '不会拼接分页' }).waitFor(); assert.equal(await viewer.locator('[data-code-line]').count(), 0); assert.equal(apiCalls.filter(row => row.method === 'view-file').length, overLinesBefore + 1, 'over-budget Host responses fail closed before DOM rendering');
+    partialView = 'over-lines'; const overLinesBefore = apiCalls.filter(row => row.method === 'view-file').length;
+    const overLinesResponse = page.waitForResponse(response => {
+      if (!response.url().endsWith('/api/code-reading') || response.request().method() !== 'POST') return false;
+      const body = response.request().postDataJSON(); return body?.method === 'view-file' && body.params?.path === 'long.ts';
+    });
+    await viewer.getByRole('button', { name: '重新加载文件', exact: true }).click();
+    assert.equal((await (await overLinesResponse).json()).value.totalLines, 20001);
+    // The preceding partial-response alert has identical text. Wait for this
+    // request and its loading state, rather than accepting the previous alert.
+    await page.waitForFunction(() => document.querySelector('.cr-file-viewer button[aria-label="重新加载文件"]')?.disabled === false && ![...document.querySelectorAll('.cr-file-viewer [role="status"]')].some(node => node.textContent.includes('正在读取真实源码')));
+    await viewer.getByRole('alert').filter({ hasText: '不会拼接分页' }).waitFor(); assert.equal(await viewer.locator('[data-code-line]').count(), 0); assert.equal(apiCalls.filter(row => row.method === 'view-file').length, overLinesBefore + 1, 'over-budget Host responses fail closed before DOM rendering');
     const replacementLong = longSource.replace('export const row1 = 1;', 'export const NEW_VERSION_START = 1;').replace('export const row451 = 451;', 'export const NEW_VERSION_END = 451;'); await fs.writeFile(path.join(repo, 'long.ts'), replacementLong);
     await viewer.getByRole('button', { name: '重新加载文件', exact: true }).click(); await viewer.locator('.cr-code-text').filter({ hasText: 'NEW_VERSION_END' }).waitFor();
     assert.equal(await viewer.locator('.cr-code-text').evaluateAll(nodes => nodes.map(node => node.textContent).join('\n')), replacementLong, 'both file boundaries come from the new single SHA, without older page content'); assert.equal(await viewer.locator('.cr-source-location summary').getAttribute('title'), `当前 SHA256：${digest(Buffer.from(replacementLong))}`); await viewer.locator('.cr-source-stale').waitFor();
