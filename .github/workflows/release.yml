@@ -2,7 +2,11 @@ name: Release plugin
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+    paths:
+      - package.json
+      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:
@@ -43,11 +47,38 @@ jobs:
           mkdirSync('work', { recursive: true });
           writeFileSync('work/release-notes.md', `## ${section.trim()}\n\n验证范围：构建、Node 回归、隔离浏览器、真实 tarball 静态核验与包内 Host/Client 复验。仅 Windows 适用的路径检查在 Linux 跳过；未安装进运行中的 DSH，未调用真实模型。\n`);
           NODE
+      - name: Check for an immutable published release
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          if state=$(gh release view "v${PACKAGE_VERSION}" --json isDraft --jq '.isDraft' 2>work/release-probe.txt); then
+            test "$state" = false || { printf 'An existing draft requires review before publication.\n'; exit 1; }
+            printf 'exists=true\n' >> "$GITHUB_OUTPUT"
+          else
+            case "$(cat work/release-probe.txt)" in
+              *"release not found"*) printf 'exists=false\n' >> "$GITHUB_OUTPUT" ;;
+              *) cat work/release-probe.txt >&2; exit 1 ;;
+            esac
+          fi
       - name: Build, test and verify the actual installation archive
+        if: steps.published.outputs.exists != 'true'
         run: |
           export DSH_TEST_BROWSER="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
           pnpm run pack:release
+      - name: Preserve verified installation assets
+        if: steps.published.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}-${{ steps.package.outputs.version }}
+          path: releases/*
+          if-no-files-found: error
+          retention-days: 14
       - name: Publish verified release assets
+        if: steps.published.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -57,7 +88,7 @@ jobs:
           set -euo pipefail
           archive="${PACKAGE_NAME}-${PACKAGE_VERSION}.tgz"
           tag="v${PACKAGE_VERSION}"
-          gh release create "$tag" --draft --verify-tag --target "$GITHUB_SHA" \
+          gh release create "$tag" --draft --verify-tag \
             --title "${PACKAGE_NAME} ${PACKAGE_VERSION}" --notes-file work/release-notes.md \
             "releases/$archive" "releases/$archive.sha256" "releases/${PACKAGE_NAME}-${PACKAGE_VERSION}.release.json"
           mkdir -p work/published
