@@ -1,0 +1,67 @@
+name: Release plugin
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install locked development dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install isolated test browser
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Prepare release metadata
+        id: package
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (pkg.name !== 'dsh-code-reading' || !/^\d+\.\d+\.\d+$/.test(pkg.version)) throw Error('Unexpected release package/version');
+          appendFileSync(process.env.GITHUB_OUTPUT, `name=${pkg.name}\nversion=${pkg.version}\n`);
+          const changelog = readFileSync('CHANGELOG.md', 'utf8');
+          const section = changelog.split(/^## /m).find(part => part.startsWith(`${pkg.version} `) || part.startsWith(`${pkg.version}\n`));
+          if (!section) throw Error('Missing release notes for package version');
+          mkdirSync('work', { recursive: true });
+          writeFileSync('work/release-notes.md', `## ${section.trim()}\n\n验证范围：构建、Node 回归、隔离浏览器、真实 tarball 静态核验与包内 Host/Client 复验。仅 Windows 适用的路径检查在 Linux 跳过；未安装进运行中的 DSH，未调用真实模型。\n`);
+          NODE
+      - name: Build, test and verify the actual installation archive
+        run: |
+          export DSH_TEST_BROWSER="$(node -e "process.stdout.write(require('playwright').chromium.executablePath())")"
+          pnpm run pack:release
+      - name: Publish verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="${PACKAGE_NAME}-${PACKAGE_VERSION}.tgz"
+          tag="v${PACKAGE_VERSION}"
+          gh release create "$tag" --draft --verify-tag --target "$GITHUB_SHA" \
+            --title "${PACKAGE_NAME} ${PACKAGE_VERSION}" --notes-file work/release-notes.md \
+            "releases/$archive" "releases/$archive.sha256" "releases/${PACKAGE_NAME}-${PACKAGE_VERSION}.release.json"
+          mkdir -p work/published
+          gh release download "$tag" --dir work/published
+          (cd work/published && sha256sum --check "$archive.sha256")
+          gh release edit "$tag" --draft=false --latest
+          printf 'Published: %s/%s/releases/tag/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$tag" >> "$GITHUB_STEP_SUMMARY"

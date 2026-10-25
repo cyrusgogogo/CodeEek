@@ -2,9 +2,7 @@
 
 一个独立于普通工作区选择的代码阅读模式：从业务问题或具体代码出发，按需要解释业务、调用链与实现逻辑，不必依次完成固定阶段。
 
-> 当前源码的 DSH 兼容目标已调整为 **0.2.1-rc.3（未发布）**。下方既有 0.1.7 安装包仍只声明兼容 **0.2.1-rc.2**，重新安装旧包不会消除 rc.3 的报错；需提升插件版本、发布新归档并安装后才会生效。
->
-> 当前源码工作区已加入代码优先的 IDE 工作台、选区逻辑图与方法级阅读关联；下方既有 0.1.7 发布归档仍是原发布时的不可变快照。源码改动需重新构建、以新版本打包并安装后才会更新已运行的 DSH。
+> 当前发布版本 **0.1.8**，目标 **DSH 0.2.1-rc.3**，包含代码优先工作台、方法级阅读、选区逻辑图与项目地图。旧 `0.1.7` 安装包仍只适用 DSH `0.2.1-rc.2`；升级需安装新版并按安装器提示完整重启 DSH。
 
 - **独立入口**：侧边栏“阅读代码”，位于工作区列表上方，不替换原工作区或对话入口。
 - **多仓库项目**：一个阅读项目绑定 1–12 个本地仓库。绑定不可变，切换普通 DSH 工作区不会改变阅读目标；添加仓库时新建项目。顶部仓库选择 → **管理仓库…** 可确认移除整个项目，仅从选择器与阅读列表收起，磁盘源码和原阅读档案保留；重新打开目录会新建项目。
@@ -29,19 +27,19 @@
 
 ## 先安装，再开始阅读
 
-当前发布版本 **0.1.7**，目标 **DSH 0.2.1-rc.2**。普通使用者安装预构建包即可，不需要另行安装 Node、pnpm、React 或现场编译；模型提供方需在 DSH 中配置。目标版本是兼容声明，不是对正在运行的 DSH 的自动探测。
+当前发布版本 **0.1.8**，目标 **DSH 0.2.1-rc.3**。普通使用者安装预构建包即可，不需要另行安装 Node、pnpm、React 或现场编译；模型提供方需在 DSH 中配置。目标版本是兼容声明，不是对正在运行的 DSH 的自动探测。
 
-**本地发布产物：**[0.1.7 安装包](<releases/dsh-code-reading-0.1.7.tgz>) · [SHA256 校验文件](<releases/dsh-code-reading-0.1.7.tgz.sha256>) · [发布报告](<releases/dsh-code-reading-0.1.7.release.json>)。这些链接指向当前源码工作区的交付文件，不是公共下载地址；仅克隆源码不保证同时获得归档。
+**发布下载：**[0.1.8 安装包](https://github.com/cyrusgogogo/dsh-codeeek/releases/download/v0.1.8/dsh-code-reading-0.1.8.tgz) · [SHA256 校验文件](https://github.com/cyrusgogogo/dsh-codeeek/releases/download/v0.1.8/dsh-code-reading-0.1.8.tgz.sha256) · [发布报告](https://github.com/cyrusgogogo/dsh-codeeek/releases/download/v0.1.8/dsh-code-reading-0.1.8.release.json)。仅克隆源码不会下载安装包；本地运行发布脚本的产物位于 `releases/`。
 
 1. 获取可信的安装包与同次发布的校验文件，核对 SHA256；校验一致不等于发布者签名。
 2. 在**当前 DSH 应用的插件／Bundle 管理界面**用归档绝对路径安装并启用。提示 `restart-required` 时必须**完整退出并重开 DSH**；仅刷新浏览器不能更新旧 Host。不要用 CLI 管理桌面版保留的 profile。
-3. 左侧打开 **阅读代码 → 安装与使用**，确认 Client、Host 都是 `0.1.7` 且项目列表加载完成，再创建项目。版本不一致时创建和发送会暂停，并显示恢复步骤。
+3. 左侧打开 **阅读代码 → 安装与使用**，确认 Client、Host 都是 `0.1.8` 且项目列表加载完成，再创建项目。版本不一致时创建和发送会暂停，并显示恢复步骤。
 
 在源码工作区根目录可用 PowerShell 获取安装路径与哈希：
 
 ```powershell
-(Resolve-Path '.\releases\dsh-code-reading-0.1.7.tgz').Path
-Get-FileHash '.\releases\dsh-code-reading-0.1.7.tgz' -Algorithm SHA256
+(Resolve-Path '.\releases\dsh-code-reading-0.1.8.tgz').Path
+Get-FileHash '.\releases\dsh-code-reading-0.1.8.tgz' -Algorithm SHA256
 ```
 
 详细步骤、完整重启／仅刷新的决策表、升级回退与按错误码排障见 [安装手册](<docs/INSTALL.md>)；从第一次创建到导出的操作见 [使用手册](<docs/USAGE.md>)；变更见 [更新记录](<CHANGELOG.md>)。
@@ -149,9 +147,9 @@ code-reading/
 
 ## 安装与兼容性
 
-当前源码目标运行时：**DSH `0.2.1-rc.3`（未发布）**。无需修改已安装 DSH 的源码，提供原生 Host 插件、独立 preset 与 Client 模块。
+当前发布目标运行时：**DSH `0.2.1-rc.3`**。无需修改已安装 DSH 的源码，提供原生 Host 插件、独立 preset 与 Client 模块。
 
-既有 `0.1.7` 发布归档仍只适用 DSH `0.2.1-rc.2`；当前源码需提升包版本并重新发布，不能覆盖或改名旧包。使用新归档绝对路径安装并启用；本工程没有 `preinstall/install/postinstall/prepare` 安装期脚本。`prepack` 只校验已有构建；不要批准不明构建脚本或为不兼容的 DSH 版本盲目授予版本豁免。发布前会拒绝覆盖旧版本文件，保护已安装引用的归档。
+既有 `0.1.7` 发布归档仍只适用 DSH `0.2.1-rc.2`；请安装新的 `0.1.8` 归档，不能覆盖或改名旧包。使用新归档绝对路径安装并启用；本工程没有 `preinstall/install/postinstall/prepare` 安装期脚本。`prepack` 只校验已有构建；不要批准不明构建脚本或为不兼容的 DSH 版本盲目授予版本豁免。发布前会拒绝覆盖旧版本文件，保护已安装引用的归档。
 
 卸载／停用不删除阅读档案；保留的旧阅读工具会 fail closed。重新启用在同一 Host 根下复用 store 与锁，避免旧会话和新页面形成双写运行时。普通 DSH 会话不受阅读工具守卫影响。
 
@@ -184,9 +182,9 @@ pnpm run doctor -- --dsh-version 0.2.1-rc.3
 对当前工作区已交付的归档，可以重复静态校验；仅在确认来源可信时才执行第二条：
 
 ```powershell
-pnpm run verify:package -- releases/dsh-code-reading-0.1.7.tgz
+pnpm run verify:package -- releases/dsh-code-reading-0.1.8.tgz
 # 会执行包内代码；不要用于未知第三方包。
-pnpm run test:package -- --trusted releases/dsh-code-reading-0.1.7.tgz
+pnpm run test:package -- --trusted releases/dsh-code-reading-0.1.8.tgz
 ```
 
 浏览器测试默认使用本机 Chrome，可通过 `DSH_TEST_BROWSER` 指定 Chromium 可执行文件。测试覆盖原生 Client 工厂、React 页面、错误恢复与 Mermaid；**这是隔离组件测试，不是当前登录 DSH 的端到端验收，也不会启动替代服务器或发起真实模型请求**。报告和截图写入测试输出目录。
@@ -201,7 +199,7 @@ pnpm run pack:release
 
 发布顺序为：**拒绝覆盖 → 构建与全部回归 → 源码新鲜度检查 → 暂存打包 → 真正 tarball 的静态校验 → 本次自身可信归档的隔离导入／接线／浏览器复验 → 排他写入安装包、SHA256 与报告**。发布失败不等于可以绕过校验直接安装暂存文件。
 
-当前 0.1.7 归档已经存在，再次向默认位置发布会在构建前拒绝，这是预期保护。重复演练可选择尚无同名产物的仓库内新目录：
+相同版本归档已经存在时，再次向默认位置发布会在构建前拒绝，这是预期保护。重复演练可选择尚无同名产物的仓库内新目录：
 
 ```powershell
 pnpm run pack:release -- --out-dir .test-output/release-check-1

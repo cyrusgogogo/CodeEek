@@ -1,6 +1,6 @@
 {
   "name": "dsh-code-reading",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "DSH 阅读代码模式：多仓库、只读取证、交互式导师、Mermaid 与阅读档案",
   "type": "module",
   "license": "MIT",
