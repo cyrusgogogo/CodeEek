@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 11.7.0
@@ -64,6 +66,12 @@ jobs:
               *) cat work/release-probe.txt >&2; exit 1 ;;
             esac
           fi
+      - name: Verify packaged sources match the immutable version tag
+        if: steps.published.outputs.exists != 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          git diff --exit-code "v${PACKAGE_VERSION}" HEAD -- package.json pnpm-lock.yaml src skills cordis.patch.yml README.md LICENSE CHANGELOG.md docs/INSTALL.md docs/USAGE.md scripts/build.mjs scripts/notices.mjs
       - name: Build, test and verify the actual installation archive
         if: steps.published.outputs.exists != 'true'
         run: |
